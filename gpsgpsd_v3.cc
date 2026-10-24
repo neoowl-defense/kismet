@@ -19,6 +19,9 @@
 #include "config.h"
 
 #include <time.h>
+
+#include <array>
+#include <cmath>
 #include <future>
 
 #include "gpsgpsd_v3.h"
@@ -28,6 +31,19 @@
 #include "util.h"
 
 #include "fmt_asio.h"
+
+namespace {
+    // A finite number, without throwing on a missing or mistyped field
+    bool json_number(const nlohmann::json& j, const char *key, double& out) {
+        const auto it = j.find(key);
+
+        if (it == j.end() || !it->is_number())
+            return false;
+
+        out = it->get<double>();
+        return std::isfinite(out);
+    }
+}
 
 kis_gps_gpsd_v3::kis_gps_gpsd_v3(shared_gps_builder in_builder, uint64_t in_id) :
     kis_gps(in_builder, in_id),
@@ -85,15 +101,18 @@ void kis_gps_gpsd_v3::handle_error() {
     set_int_device_connected(false);
     stopped = true;
 
+    // Runs on the strand, which a timer holding gps_mutex may be waiting on; the timer
+    // holds a reference to us, so cancelling is enough
     if (error_reconnect_timer > 0)
-        timetracker->remove_timer(error_reconnect_timer);
+        timetracker->cancel_timer(error_reconnect_timer);
 
     error_reconnect_timer = 
         timetracker->register_timer(SERVER_TIMESLICES_SEC * 10, NULL, 0,
                 [self = shared_from_this()](int) -> int {
                     kis_lock_guard<kis_mutex> lk(self->gps_mutex, "error timer");
 
-                    if (self->socket.is_open() || !self->get_gps_reconnect())
+                    // A failed connect can leave the socket open, so go by the connection state
+                    if (self->get_device_connected() || !self->get_gps_reconnect())
                         return 0;
 
                     self->open_gps(self->get_gps_definition());
@@ -131,6 +150,8 @@ void kis_gps_gpsd_v3::close_impl() {
 
     while (!out_bufs.empty())
         out_bufs.pop();
+
+    clear_quality();
 
     in_buf.consume(in_buf.size() + 1);
 }
@@ -295,6 +316,10 @@ void kis_gps_gpsd_v3::handle_read(const boost::system::error_code& error, std::s
     bool set_heading = false;
     bool set_magheading = false;
 
+    // GPSD is the only source for this GPS, so it ranks with the binary protocols
+    gps_quality_update quality;
+    quality.rank = gps_quality_update::source_rank::binary;
+
     // We don't know what we're going to get from GPSD.  If it starts with 
     // { then it probably is json, try to parse it
     if (line[0] == '{') {
@@ -331,6 +356,23 @@ void kis_gps_gpsd_v3::handle_read(const boost::system::error_code& error, std::s
                 new_location->error_y = json.value("epy", (double) 0);
                 new_location->error_v = json.value("epv", (double) 0);
 
+                // 95% confidence estimates, meters
+                double eph, epx, epy, epv;
+
+                if (json_number(json, "eph", eph) && eph > 0) {
+                    quality.has_error_h = true;
+                    quality.error_h = eph;
+                } else if (json_number(json, "epx", epx) && json_number(json, "epy", epy) &&
+                        epx >= 0 && epy >= 0 && epx + epy > 0) {
+                    quality.has_error_h = true;
+                    quality.error_h = std::sqrt(epx * epx + epy * epy);
+                }
+
+                if (json_number(json, "epv", epv) && epv > 0) {
+                    quality.has_error_v = true;
+                    quality.error_v = epv;
+                }
+
 
                 if (set_fix && new_location->fix >= 2) {
                     new_location->lat = json.value("lat", (double) 0);
@@ -355,60 +397,86 @@ void kis_gps_gpsd_v3::handle_read(const boost::system::error_code& error, std::s
                     last_att_heading_time = time(0);
                     last_att_heading = heading_j;
                 }
-#if 0
             } else if (msg_class == "SKY") {
-                GPSCore::sat_pos sp;
-                struct JSON_value *v = NULL, *s = NULL;
+                double v;
 
-                gps_connected = 1;
+                if (json_number(json, "hdop", v) && v > 0) {
+                    quality.has_hdop = true;
+                    quality.hdop = v;
+                }
 
-                v = JSON_dict_get_value(json, "satellites", err);
+                if (json_number(json, "vdop", v) && v > 0) {
+                    quality.has_vdop = true;
+                    quality.vdop = v;
+                }
 
-                if (err.length() == 0 && v != NULL) {
-                    sat_pos_map.clear();
+                // Older GPSD only sends the satellite list
+                const auto sats = json.find("satellites");
+                std::array<double, 255> cn0;
+                size_t ncn0 = 0;
+                unsigned int listed = 0;
+                unsigned int used = 0;
 
-                    if (v->value.tok_type == JSON_arrstart) {
-                        for (unsigned int z = 0; z < v->value_array.size(); z++) {
-                            float prn, ele, az, snr;
-                            int valid = 1;
+                if (sats != json.end() && sats->is_array()) {
+                    for (const auto& sat : *sats) {
+                        if (listed >= cn0.size())
+                            break;
 
-                            s = v->value_array[z];
+                        if (!sat.is_object())
+                            continue;
 
-                            // If we're not a dictionary in the sat array, skip
-                            if (s->value.tok_type != JSON_start) {
-                                continue;
-                            }
+                        listed++;
 
-                            prn = JSON_dict_get_number(s, "PRN", err);
-                            if (err.length() != 0) 
-                                valid = 0;
+                        gps_satellite gs;
 
-                            ele = JSON_dict_get_number(s, "el", err);
-                            if (err.length() != 0)
-                                valid = 0;
-
-                            az = JSON_dict_get_number(s, "az", err);
-                            if (err.length() != 0)
-                                valid = 0;
-
-                            snr = JSON_dict_get_number(s, "ss", err);
-                            if (err.length() != 0)
-                                valid = 0;
-
-                            if (valid) {
-                                sp.prn = prn;
-                                sp.elevation = ele;
-                                sp.azimuth = az;
-                                sp.snr = snr;
-
-                                sat_pos_map[prn] = sp;
-                            }
+                        if (json_number(sat, "ss", v) && v > 0) {
+                            cn0[ncn0++] = v;
+                            gs.cn0 = v;
                         }
 
+                        const auto u = sat.find("used");
+                        if (u != sat.end() && u->is_boolean()) {
+                            gs.used = u->get<bool>() ? 1 : 0;
+                            if (gs.used)
+                                used++;
+                        }
+
+                        // Newer gpsd names the constellation; older numbers satellites across them
+                        double gnss, svid, prn;
+                        if (json_number(sat, "gnssid", gnss) && json_number(sat, "svid", svid) &&
+                                gnss >= 0 && gnss < 256 && svid >= 0 && svid < 65536) {
+                            gs.constellation = gps_constellation_from_gnss_id(static_cast<unsigned int>(gnss));
+                            gs.id = static_cast<uint16_t>(svid);
+                        } else if (json_number(sat, "PRN", prn) && prn >= 0 && prn < 65536) {
+                            gs.constellation = gps_constellation_from_prn(static_cast<unsigned int>(prn));
+                            gs.id = static_cast<uint16_t>(prn);
+                        }
+
+                        if (json_number(sat, "el", v) && v >= -90 && v <= 90)
+                            gs.elevation = static_cast<int16_t>(std::max(0.0, v));
+                        if (json_number(sat, "az", v) && v >= 0 && v < 360)
+                            gs.azimuth = static_cast<int16_t>(v);
+
+                        quality.satellites.push_back(gs);
                     }
 
+                    quality.has_satellites = true;
+                    quality.has_sats_visible = true;
+                    quality.sats_visible = listed;
+                    quality.has_sats_used = true;
+                    quality.sats_used = used;
+                    quality.has_cn0 = gps_quality_update::strongest_cn0(cn0.data(), ncn0, quality.cn0);
                 }
-#endif
+
+                if (json_number(json, "nSat", v) && v >= 0 && v < 256) {
+                    quality.has_sats_visible = true;
+                    quality.sats_visible = static_cast<unsigned int>(v);
+                }
+
+                if (json_number(json, "uSat", v) && v >= 0 && v < 256) {
+                    quality.has_sats_used = true;
+                    quality.sats_used = static_cast<unsigned int>(v);
+                }
             }
 
         } catch (std::exception& e) {
@@ -648,6 +716,8 @@ void kis_gps_gpsd_v3::handle_read(const boost::system::error_code& error, std::s
     // Only use set_lat_lon, we don't want to clobber locations with fragmented 
     // reports with 0x0 as the location!
     if (set_lat_lon) {
+		new_location->gps_info_ok = true;
+
         set_int_gps_signal_time(last_data_time);
 
         gettimeofday(&(new_location->tv), NULL);
@@ -679,6 +749,9 @@ void kis_gps_gpsd_v3::handle_read(const boost::system::error_code& error, std::s
     }
 
     lk.unlock();
+
+    if (!quality.empty())
+        apply_quality(quality);
 
     // Initiate another read
     return start_read();

@@ -30,21 +30,70 @@
 #include "timetracker.h"
 
 void channel_tracker_v3_channel::as_json(std::ostream& os, json_adapter_v2::opts *opts) {
-	auto sv_comma = opts->next_key_comma;
-	opts->next_key_comma = false;
+    auto sv_comma = opts->next_key_comma;
+    opts->next_key_comma = false;
 
-	fmt::print(os, "{{");
+    fmt::print(os, "{{");
 
-	json_adapter_v2::encode_keyed(os, "kismet.channelrec.channel", opts, channel);
-	json_adapter_v2::encode_keyed(os, "kismet.channelrec.frequency", opts, frequency);
-	json_adapter_v2::encode_keyed<json_adapter_v2::jsonable>(os, "kismet.channelrec.packets_rrd", opts, &packets_rrd);
-	json_adapter_v2::encode_keyed<json_adapter_v2::jsonable>(os, "kismet.channelrec.data_rrd", opts, &data_rrd);
-	json_adapter_v2::encode_keyed<json_adapter_v2::jsonable>(os, "kismet.channelrec.device_rrd", opts, &device_rrd);
-	json_adapter_v2::encode_keyed<json_adapter_v2::jsonable>(os, "kismet.channelrec.signal", opts, &signal_data);
+    json_adapter_v2::json_encode_keyed<std::string>{}(os, "kismet.channelrec.channel", opts, channel);
+    json_adapter_v2::json_encode_keyed<double>{}(os, "kismet.channelrec.frequency", opts, frequency);
+    json_adapter_v2::json_encode_keyed<decltype(packets_rrd)>{}(os, "kismet.channelrec.packets_rrd", opts, packets_rrd);
+    json_adapter_v2::json_encode_keyed<decltype(data_rrd)>{}(os, "kismet.channelrec.data_rrd", opts, data_rrd);
+    json_adapter_v2::json_encode_keyed<decltype(device_rrd)>{}(os, "kismet.channelrec.device_rrd", opts, device_rrd);
+    json_adapter_v2::json_encode_keyed<kis_tracked_signal_data_v2>{}(os, "kismet.channelrec.signal", opts, signal_data);
 
-	fmt::print(os, "}}");
+    fmt::print(os, "}}");
 
-	opts->next_key_comma = sv_comma;
+    opts->next_key_comma = sv_comma;
+}
+
+void channel_tracker_v3_channel::filtered_as_json(std::ostream& os, json_adapter_v2::opts *opts, const json_adapter_v2::field_group_map& fields) {
+    if (fields.size() == 0) {
+        return as_json(os, opts);
+    }
+
+    auto sv_comma = opts->next_key_comma;
+    opts->next_key_comma = false;
+
+    fmt::print(os, "{{");
+
+    json_adapter_v2::field_group_map subgroup;
+
+    for (const auto& f : fields) {
+        switch (json_adapter_v2::consthash(f.first)) {
+            case json_adapter_v2::consthash("kismet.channelrec.channel"):
+                json_adapter_v2::json_encode_keyed<std::string>{}(os, f.second.rename, opts, channel);
+                break;
+            case json_adapter_v2::consthash("kismet.channelrec.frequency"):
+                json_adapter_v2::json_encode_keyed<double>{}(os, f.second.rename, opts, frequency);
+                break;
+            case json_adapter_v2::consthash("kismet.channelrec.packets_rrd"):
+                subgroup.clear();
+                json_adapter_v2::group_fields(f.second.subfields, subgroup);
+                json_adapter_v2::json_encode_keyed<decltype(packets_rrd)>{}(os, f.second.rename, opts, packets_rrd, subgroup);
+                break;
+            case json_adapter_v2::consthash("kismet.channelrec.data_rrd"):
+                subgroup.clear();
+                json_adapter_v2::group_fields(f.second.subfields, subgroup);
+                json_adapter_v2::json_encode_keyed<decltype(data_rrd)>{}(os, f.second.rename, opts, data_rrd, subgroup);
+                break;
+            case json_adapter_v2::consthash("kismet.channelrec.device_rrd"):
+                subgroup.clear();
+                json_adapter_v2::group_fields(f.second.subfields, subgroup);
+                json_adapter_v2::json_encode_keyed<decltype(device_rrd)>{}(os, f.second.rename, opts, device_rrd, subgroup);
+                break;
+            case json_adapter_v2::consthash("kismet.channelrec.signal"):
+                subgroup.clear();
+                json_adapter_v2::group_fields(f.second.subfields, subgroup);
+                json_adapter_v2::json_encode_keyed<kis_tracked_signal_data_v2>{}(os, f.second.rename, opts, signal_data, subgroup);
+                break;
+            default:
+                json_adapter_v2::json_encode_keyed<int>{}(os, f.second.rename, opts, 0);
+        }
+    }
+
+    fmt::print(os, "}}");
+    opts->next_key_comma = sv_comma;
 }
 
 channel_tracker_v3::channel_tracker_v3() :
@@ -67,8 +116,7 @@ channel_tracker_v3::channel_tracker_v3() :
 
     packetchain->register_handler(&packet_chain_handler, this, CHAINPOS_LOGGING, 0);
 
-	pack_comp_device = packetchain->register_packet_component("DEVICE");
-	pack_comp_l1data = packetchain->register_packet_component("RADIODATA");
+    pack_comp_device = packetchain->register_packet_component("DEVICE");
 
     devicetracker =
         Globalreg::fetch_mandatory_global_as<device_tracker>("DEVICETRACKER");
@@ -85,15 +133,18 @@ channel_tracker_v3::channel_tracker_v3() :
 }
 
 channel_tracker_v3::~channel_tracker_v3() {
-    kis_lock_guard<kis_mutex> lk(lock, __func__);
+    // Remove the handler before taking the lock; remove_handler() waits for packet threads
+    // still in packet_chain_handler(), which takes it
+    auto packetchain = Globalreg::fetch_global_as<packet_chain>("PACKETCHAIN");
+    if (packetchain != nullptr)
+        packetchain->remove_handler(&packet_chain_handler, CHAINPOS_LOGGING);
 
+    // Before taking the lock; the timer callback takes it too
     auto timetracker = Globalreg::fetch_global_as<time_tracker>("TIMETRACKER");
     if (timetracker != nullptr)
         timetracker->remove_timer(timer_id);
 
-    auto packetchain = Globalreg::fetch_global_as<packet_chain>("PACKETCHAIN");
-    if (packetchain != nullptr)
-        packetchain->remove_handler(&packet_chain_handler, CHAINPOS_LOGGING);
+    kis_lock_guard<kis_mutex> lk(lock, __func__);
 
     Globalreg::globalreg->remove_global(global_name());
 }
@@ -158,14 +209,14 @@ void channel_tracker_v3::update_device_counts(std::unordered_map<double, unsigne
     kis_lock_guard<kis_mutex> lk(lock, __func__);
 
     for (const auto& i : in_counts) {
-		auto const& imi_idx = frequency_map.try_emplace(i.first, channel_tracker_v3_channel{});
-		auto& freq = imi_idx.first->second;
+        auto const& imi_idx = frequency_map.try_emplace(i.first, channel_tracker_v3_channel{});
+        auto& freq = imi_idx.first->second;
 
-		if (imi_idx.second) {
-			freq.frequency = i.first;
-		}
+        if (imi_idx.second) {
+            freq.frequency = i.first;
+        }
 
-		freq.device_rrd.add_sample(i.second, ts);
+        freq.device_rrd.add_sample(i.second, ts);
     }
 }
 
@@ -174,60 +225,97 @@ int channel_tracker_v3::packet_chain_handler(CHAINCALL_PARMS) {
 
     kis_lock_guard<kis_mutex> lk(cv3->lock, __func__);
 
-    auto l1info = in_pack->fetch<kis_layer1_packinfo>(cv3->pack_comp_l1data);
+    // auto l1info = in_pack->fetch<kis_layer1_packinfo>(cv3->pack_comp_l1data);
 
     // Nothing to do with no l1info
-    if (l1info == nullptr)
+    if (!in_pack->signal_info.data_ok)
         return 1;
 
     // Find or make a frequency record if we know our frequency
-    if (l1info->freq_khz != 0) {
-		auto const& imi_idx = cv3->frequency_map.try_emplace(l1info->freq_khz, channel_tracker_v3_channel{});
-		auto& freq = imi_idx.first->second;
+    if (in_pack->signal_info.freq_khz != 0) {
+        auto const& imi_idx = cv3->frequency_map.try_emplace(in_pack->signal_info.freq_khz, channel_tracker_v3_channel{});
+        auto& freq = imi_idx.first->second;
 
-		if (imi_idx.second) {
-			freq.frequency = l1info->freq_khz;
-		}
+        if (imi_idx.second) {
+            freq.frequency = in_pack->signal_info.freq_khz;
+        }
 
-		freq.signal_data.append_signal(*l1info, false, 0);
-		freq.packets_rrd.add_sample(1, Globalreg::globalreg->last_tv_sec);
+        freq.signal_data.append_signal(in_pack->signal_info, false, 0);
+        freq.packets_rrd.add_sample(1, Globalreg::globalreg->last_tv_sec);
 
-		if (in_pack->common_info_ok) {
-			freq.data_rrd.add_sample(in_pack->common_info.datasize,
-					Globalreg::globalreg->last_tv_sec);
-		}
+        if (in_pack->common_info.common_info_ok) {
+            freq.data_rrd.add_sample(in_pack->common_info.datasize,
+                    Globalreg::globalreg->last_tv_sec);
+        }
     }
 
-    if (in_pack->common_info_ok) {
+    if (in_pack->common_info.common_info_ok) {
         if (!(in_pack->common_info.channel == "0" || in_pack->common_info.channel == "")) {
-			auto const& smi_idx = cv3->channel_map.try_emplace(in_pack->common_info.channel, channel_tracker_v3_channel{});
-			auto& chan = smi_idx.first->second;
+            auto const& smi_idx =
+                cv3->channel_map.try_emplace(in_pack->common_info.channel, channel_tracker_v3_channel{});
+            auto& chan = smi_idx.first->second;
 
-			if (smi_idx.second) {
-				chan.channel = in_pack->common_info.channel;
-				chan.frequency = l1info->freq_khz;
-			}
+            if (smi_idx.second) {
+                chan.channel = in_pack->common_info.channel;
+                chan.frequency = in_pack->signal_info.freq_khz;
+            }
 
-			chan.signal_data.append_signal(*l1info, false, 0);
-			chan.packets_rrd.add_sample(1, Globalreg::globalreg->last_tv_sec);
-			chan.data_rrd.add_sample(in_pack->common_info.datasize, Globalreg::globalreg->last_tv_sec);
-		}
+            chan.signal_data.append_signal(in_pack->signal_info, false, 0);
+            chan.packets_rrd.add_sample(1, Globalreg::globalreg->last_tv_sec);
+            chan.data_rrd.add_sample(in_pack->common_info.datasize, Globalreg::globalreg->last_tv_sec);
+        }
     }
 
     return 1;
 }
 
 void channel_tracker_v3::as_json(std::ostream& os, json_adapter_v2::opts *opts) {
-	auto sv_comma = opts->next_key_comma;
-	opts->next_key_comma = false;
+    auto sv_comma = opts->next_key_comma;
+    opts->next_key_comma = false;
 
-	fmt::print(os, "{{");
+    fmt::print(os, "{{");
 
-	json_adapter_v2::encode_keyed_map<json_adapter_v2::jsonable&>(os, "kismet.channeltracker.channel_map", opts, channel_map.begin(), channel_map.end());
-	json_adapter_v2::encode_keyed_map<json_adapter_v2::jsonable&>(os, "kismet.channeltracker.frequency_map", opts, frequency_map.begin(), frequency_map.end());
+    json_adapter_v2::json_encode_keyed_map<channel_map_iter_t>{}(os, "kismet.channeltracker.channel_map", opts, channel_map.begin(), channel_map.end());
+    json_adapter_v2::json_encode_keyed_map<frequency_map_iter_t>{}(os, "kismet.channeltracker.frequency_map", opts, frequency_map.begin(), frequency_map.end());
 
-	fmt::print(os, "}}");
+    fmt::print(os, "}}");
 
-	opts->next_key_comma = sv_comma;
+    opts->next_key_comma = sv_comma;
+}
+
+void channel_tracker_v3::filtered_as_json(std::ostream& os, json_adapter_v2::opts *opts,
+        const json_adapter_v2::field_group_map& fields) {
+
+    if (fields.size() == 0) {
+        return as_json(os, opts);
+    }
+
+    auto sv_comma = opts->next_key_comma;
+    opts->next_key_comma = false;
+
+    fmt::print(os, "{{");
+
+    json_adapter_v2::field_group_map subgroup;
+
+    for (const auto& f : fields) {
+        switch (json_adapter_v2::consthash(f.first)) {
+            case json_adapter_v2::consthash("kismet.channeltracker.channel_map"):
+                subgroup.clear();
+                json_adapter_v2::group_fields(f.second.subfields, subgroup);
+                json_adapter_v2::json_encode_keyed_map<channel_map_iter_t>{}(os, f.second.rename, opts,
+                        channel_map.begin(), channel_map.end(), subgroup);
+                break;
+            case json_adapter_v2::consthash("kismet.channeltracker.frequency_map"):
+                subgroup.clear();
+                json_adapter_v2::group_fields(f.second.subfields, subgroup);
+                json_adapter_v2::json_encode_keyed_map<frequency_map_iter_t>{}(os, f.second.rename, opts,
+                        frequency_map.begin(), frequency_map.end(), subgroup);
+                break;
+        }
+    }
+
+    fmt::print(os, "}}");
+
+    opts->next_key_comma = sv_comma;
 }
 

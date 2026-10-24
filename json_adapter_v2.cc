@@ -18,8 +18,154 @@
 
 #include "json_adapter_v2.h"
 
+int hash(const std::string_view& sv) noexcept{
+    uint32_t hash = 5381;
+
+    for(const char *c = sv.data(); c < sv.data() + sv.length(); ++c) {
+        hash = ((hash << 5) + hash) + (unsigned char) *c;
+    }
+
+    return (int) hash;
+}
+
+std::string_view json_adapter_v2::pop_path(std::string_view& v) {
+    const auto pos = v.find_first_of("/");
+    if (pos == std::string_view::npos) {
+        return v;
+    }
+
+    const auto fn = v.substr(0, pos);
+    v.remove_prefix(pos + 1);
+
+    return fn;
+}
+
+std::string_view json_adapter_v2::peek_path(const std::string_view& v) {
+    const auto pos = v.find_first_of("/");
+    if (pos == std::string_view::npos) {
+        return v;
+    }
+
+    return v.substr(0, pos);
+}
+
+void json_adapter_v2::group_fields(const json_adapter_v2::single_field_list& fields, field_group_map& grouped) {
+    for (const auto& of : fields) {
+        // get the parent object field
+        std::string_view fn{of};
+        const auto fp = json_adapter_v2::pop_path(fn);
+
+        std::string_view rename_empty;
+        const auto lp = fp.find_last_of("/");
+        if (lp == std::string_view::npos) {
+            rename_empty = fp;
+        } else {
+            rename_empty = fp.substr(lp + 1, fp.length());
+        }
+
+        // aggregate multiple child fields into one object
+        const auto& ins = grouped.try_emplace(std::string(fp.data(), fp.length()),
+                json_adapter_v2::field_group{.field = fn});
+
+        if (ins.second) {
+            // if we have more path components, append this field as a subfield immediately
+            if (fp != fn) {
+                ins.first->second.subfields.push_back(std::make_pair(fn, of));
+            } else {
+                ins.first->second.rename = std::string(rename_empty.data(), rename_empty.length());
+            }
+        } else {
+            // promote a single-field entry to a nested entry
+            if (ins.first->second.subfields.size() == 0) {
+                ins.first->second.subfields.push_back(std::make_pair(ins.first->second.field, ins.first->second.rename));
+                ins.first->second.rename = "";
+            }
+
+            ins.first->second.subfields.push_back(std::make_pair(fn, of));
+        }
+    }
+}
+
+void json_adapter_v2::group_fields(const json_adapter_v2::raw_field_list& fields, field_group_map& grouped) {
+    for (const auto& of : fields) {
+        // get the parent object field
+        std::string_view fn{of.first};
+        const auto fp = json_adapter_v2::pop_path(fn);
+
+        std::string_view rename_empty;
+        if (of.second == "") {
+            const auto lp = fp.find_last_of("/");
+            if (lp == std::string_view::npos) {
+                rename_empty = fp;
+            } else {
+                rename_empty = fp.substr(lp + 1, fp.length());
+            }
+        }
+
+        // aggregate multiple child fields into one object
+        const auto& ins = grouped.try_emplace(std::string(fp.data(), fp.length()),
+                json_adapter_v2::field_group{.field = fn});
+
+        if (ins.second) {
+            // if we have more path components, append this field as a subfield immediately
+            if (fp != fn) {
+                ins.first->second.subfields.push_back(std::make_pair(fn, of.second));
+            } else {
+                ins.first->second.rename = of.second != "" ? of.second : std::string(rename_empty.data(), rename_empty.length());
+            }
+        } else {
+            // promote a single-field entry to a nested entry
+            if (ins.first->second.subfields.size() == 0) {
+                ins.first->second.subfields.push_back(std::make_pair(ins.first->second.field, ins.first->second.rename));
+                ins.first->second.rename = "";
+            }
+
+            ins.first->second.subfields.push_back(std::make_pair(fn, of.second));
+        }
+    }
+}
+
+void json_adapter_v2::group_fields(const json_adapter_v2::mod_field_list& fields, field_group_map& grouped) {
+    for (const auto& of : fields) {
+        // get the parent object field
+        std::string_view fn{of.first};
+        const auto fp = json_adapter_v2::pop_path(fn);
+
+        std::string_view rename_empty;
+        if (of.second == "") {
+            const auto lp = fp.find_last_of("/");
+            if (lp == std::string_view::npos) {
+                rename_empty = fp;
+            } else {
+                rename_empty = fp.substr(lp + 1, fp.length());
+            }
+        }
+
+        // aggregate multiple child fields into one object
+        const auto& ins = grouped.try_emplace(std::string(fp.data(), fp.length()),
+                json_adapter_v2::field_group{.field = fn});
+
+        if (ins.second) {
+            // if we have more path components, append this field as a subfield immediately
+            if (fp != fn) {
+                ins.first->second.subfields.push_back(std::make_pair(fn, of.second));
+            } else {
+                ins.first->second.rename = of.second != "" ? of.second : std::string(rename_empty.data(), rename_empty.length());
+            }
+        } else {
+            // promote a single-field entry to a nested entry
+            if (ins.first->second.subfields.size() == 0) {
+                ins.first->second.subfields.push_back(std::make_pair(ins.first->second.field, ins.first->second.rename));
+                ins.first->second.rename = "";
+            }
+
+            ins.first->second.subfields.push_back(std::make_pair(fn, of.second));
+        }
+    }
+}
 
 void json_adapter_v2::serialize(std::ostream& os, jsonable *object,
+        const std::string& extension, json_adapter_v2::raw_field_list& fields,
         json_adapter_v2::name_permute_fn permute_fn) {
     json_adapter_v2::opts json_opts;
 
@@ -27,40 +173,10 @@ void json_adapter_v2::serialize(std::ostream& os, jsonable *object,
     json_opts.name_permute = permute_fn;
     json_opts.next_key_comma = false;
 
-    object->as_json(os, &json_opts);
-}
+    json_adapter_v2::field_group_map grouped;
+    json_adapter_v2::group_fields(fields, grouped);
 
-template<> void json_adapter_v2::encode<std::string>(std::ostream& os,
-        json_adapter_v2::opts *opts, const std::string& e) {
-    fmt::print(os, "\"{}\"", sanitize_string(e));
-}
-
-template<> void json_adapter_v2::encode<char>(std::ostream& os,
-        json_adapter_v2::opts *opts, const char *e) {
-    fmt::print(os, "\"{}\"", sanitize_string(e));
-}
-
-template<> void json_adapter_v2::encode<json_adapter_v2::jsonable>(std::ostream& os,
-        json_adapter_v2::opts *opts, json_adapter_v2::jsonable *e) {
-    e->as_json(os, opts);
-}
-
-template<> void json_adapter_v2::encode<json_adapter_v2::jsonable&>(std::ostream& os,
-        json_adapter_v2::opts *opts, json_adapter_v2::jsonable& e) {
-    e.as_json(os, opts);
-}
-
-template<>
-void json_adapter_v2::encode_keyed<json_adapter_v2::jsonable>(std::ostream& os, const std::string& field,
-        json_adapter_v2::opts *opts, json_adapter_v2::jsonable *e) {
-    if (opts->next_key_comma) {
-        fmt::print(os, ",");
-    }
-
-    fmt::print(os, "{}:", opts->name_permute(field));
-    encode<json_adapter_v2::jsonable>(os, opts, e);
-
-    opts->next_key_comma = true;
+    object->filtered_as_json(os, &json_opts, grouped);
 }
 
 /* sanitize_extra_space and sanitize_string taken from nlohmann's jsonhpp library,

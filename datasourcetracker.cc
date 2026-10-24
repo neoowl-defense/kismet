@@ -21,6 +21,8 @@
 #include <string.h>
 #include <getopt.h>
 
+#include <cmath>
+
 #include <string_view>
 
 #include "alertracker.h"
@@ -62,9 +64,10 @@ void datasource_tracker_source_probe::cancel() {
 
     cancelled = true;
 
-    // Cancel any timers
+    // Cancel any timers; they hold this probe and call cancel(), which needs probe_lock,
+    // so don't wait for them
     for (auto i : cancel_timer_vec)
-        timetracker->remove_timer(i);
+        timetracker->cancel_timer(i);
 
     if (probe_cb) {
         lk.unlock();
@@ -205,7 +208,7 @@ void datasource_tracker_source_probe::probe_sources(std::function<void (unsigned
 
         i.second->probe_interface(definition, i.first,
                 [cancel_timer, self=shared_from_this()](unsigned int transaction, bool success, std::string reason) {
-                    self->timetracker->remove_timer(cancel_timer);
+                    self->timetracker->cancel_timer(cancel_timer);
                     self->complete_probe(success, transaction, reason);
                 });
     }
@@ -241,7 +244,8 @@ void datasource_tracker_source_list::cancel() {
 
     cancelled = true;
 
-    timetracker->remove_timer(cancel_event_id);
+    // The timer holds this list and calls cancel(), which needs list_lock
+    timetracker->cancel_timer(cancel_event_id);
 
     if (ipc_list_map.size() == 0 && list_cb) {
         list_cb(listed_sources);
@@ -341,7 +345,8 @@ void datasource_tracker_source_list::list_sources(std::shared_ptr<datasource_tra
 
 datasource_tracker::datasource_tracker() :
     remotecap_enabled{false},
-    remotecap_port{0} {
+    remotecap_port{0},
+    packet_stats_handler_id{-1} {
 
     dst_lock.set_name("datasourcetracker");
 
@@ -385,6 +390,12 @@ datasource_tracker::~datasource_tracker() {
         databaselog_write_datasources();
     }
 
+    if (packet_stats_handler_id >= 0) {
+        auto packetchain = Globalreg::fetch_global_as<packet_chain>();
+        if (packetchain != nullptr)
+            packetchain->remove_handler(packet_stats_handler_id, CHAINPOS_LOGGING);
+    }
+
     for (auto i : probing_map)
         i.second->cancel();
 
@@ -418,8 +429,6 @@ std::shared_ptr<datasource_tracker_defaults> datasource_tracker::get_config_defa
 }
 
 void datasource_tracker::trigger_deferred_startup() {
-    bool used_args = false;
-
     completion_cleanup_id = -1;
     next_probe_id = 0;
     next_list_id = 0;
@@ -557,16 +566,33 @@ void datasource_tracker::trigger_deferred_startup() {
     auto packetchain = Globalreg::fetch_mandatory_global_as<packet_chain>();
     pack_comp_datasrc = packetchain->register_packet_component("KISDATASRC");
 
-    std::vector<std::string> src_vec;
+    // Run after everything else so any stage can have flagged the packet; this is where each
+    // packet from a source is counted as valid, error or filtered
+    packet_stats_handler_id =
+        packetchain->register_handler([](void *auxdata, const std::shared_ptr<kis_packet>& packet) -> int {
+                auto dst = reinterpret_cast<datasource_tracker *>(auxdata);
+                const auto datasrcinfo =
+                    packet->fetch<packetchain_comp_datasource>(dst->pack_comp_datasrc);
 
-    int option_idx = 0;
+                if (datasrcinfo == nullptr || datasrcinfo->ref_source == nullptr)
+                    return 1;
 
-	static struct option packetsource_long_options[] = {
-		{ "capture-source", required_argument, 0, 'c' },
-		{ 0, 0, 0, 0 }
-	};
+                // A failed FCS check counts as an error even if nothing flagged it
+                const bool error = packet->error || (packet->crc_ok && !packet->checksum_valid);
 
-    optind = 0;
+                if (!error && !packet->filtered) {
+                    datasrcinfo->ref_source->inc_source_num_packets(1);
+                    return 1;
+                }
+
+                if (error)
+                    datasrcinfo->ref_source->inc_source_num_error_packets(1);
+
+                if (packet->filtered)
+                    datasrcinfo->ref_source->inc_source_num_filtered_packets(1);
+
+                return 1;
+            }, this, CHAINPOS_LOGGING, 10000);
 
     // Activate remote capture
     if (config_defaults->get_remote_cap_listen().length() != 0 &&
@@ -821,7 +847,7 @@ void datasource_tracker::trigger_deferred_startup() {
                         throw std::runtime_error("no such datasource");
 
                     _MSG_INFO("Closing source '{}' ({})", ds->get_source_name(), ds->get_source_uuid());
-                    ds->disable_source();
+                    ds->stop_source();
                     return(ds);
                 }));
 
@@ -838,7 +864,7 @@ void datasource_tracker::trigger_deferred_startup() {
                     if (ds == nullptr)
                         throw std::runtime_error("no such datasource");
 
-                    _MSG_INFO("Closing source '{}' ({})", ds->get_source_name(), ds->get_source_uuid());
+                    _MSG_INFO("Disabling source '{}' ({})", ds->get_source_name(), ds->get_source_uuid());
                     ds->disable_source();
                     return(ds);
                 }));
@@ -864,6 +890,8 @@ void datasource_tracker::trigger_deferred_startup() {
                         throw std::runtime_error("source already running");
 
                     _MSG_INFO("Re-opening source '{}' ({})", ds->get_source_name(), ds->get_source_uuid());
+
+                    ds->clear_source_disabled();
 
                     ds->open_interface(ds->get_source_definition(), 0,
                             [&set_success, &set_promise](unsigned int, bool success, std::string) mutable {
@@ -896,7 +924,7 @@ void datasource_tracker::trigger_deferred_startup() {
 
                     if (!ds->get_source_paused()) {
                         _MSG_INFO("Pausing source '{}' ({})", ds->get_source_name(), ds->get_source_uuid());
-                        ds->set_source_paused(true);
+                        ds->pause_source();
                         return(ds);
                     } else {
                         throw std::runtime_error("Source already paused");
@@ -1087,7 +1115,23 @@ void datasource_tracker::trigger_deferred_startup() {
                     }
                 }
                 }));
+}
 
+// Open the sources from -c or source=.  Called by main() once plugins are active, so sources of a
+// type a plugin registers can be opened too.
+void datasource_tracker::launch_configured_sources() {
+    bool used_args = false;
+
+    std::vector<std::string> src_vec;
+
+    int option_idx = 0;
+
+	static struct option packetsource_long_options[] = {
+		{ "capture-source", required_argument, 0, 'c' },
+		{ 0, 0, 0, 0 }
+	};
+
+    optind = 0;
 
     while (1) {
         int r = getopt_long(Globalreg::globalreg->argc, Globalreg::globalreg->argv, "-c:",
@@ -1256,24 +1300,18 @@ shared_datasource datasource_tracker::find_datasource(const uuid& in_uuid) {
 bool datasource_tracker::close_datasource(const uuid& in_uuid) {
     kis_lock_guard<kis_mutex> lk(dst_lock, "dst close_datasource");
 
-    shared_datasource kds;
-
     for (auto i : *datasource_vec) {
-        kds = std::static_pointer_cast<kis_datasource>(i);
+        auto kds = std::static_pointer_cast<kis_datasource>(i);
 
         if (kds->get_source_uuid() == in_uuid) {
-            break;
+            _MSG_INFO("Closing source '{}'", kds->get_source_name());
+
+            // close it
+            kds->close_source();
+
+            // Done
+            return true;
         }
-    }
-
-    if (kds != nullptr) {
-        _MSG_INFO("Closing source '{}'", kds->get_source_name());
-
-        // close it
-        kds->close_source();
-
-        // Done
-        return true;
     }
 
     return false;
@@ -1680,8 +1718,11 @@ std::shared_ptr<kis_datasource> datasource_tracker::open_remote_datasource(dst_i
 
     kis_unique_lock<kis_mutex> lock(dst_lock, "dst open_remote_datasource");
 
-    // Look for an existing datasource with the same UUID
+    // Look for an existing datasource with the same UUID, if the remote announced one
     for (auto p : *datasource_vec) {
+        if (in_uuid.error)
+            break;
+
         shared_datasource d = std::static_pointer_cast<kis_datasource>(p);
 
         if (d->get_source_uuid() == in_uuid) {
@@ -1699,6 +1740,14 @@ std::shared_ptr<kis_datasource> datasource_tracker::open_remote_datasource(dst_i
                     "the rtlsdr family, you may need to manually set the uuid= source parameter.",
                     in_uuid.uuid_to_string(), merge_target_device->get_source_name());
             incoming->trigger_error("mismatch device type for this uuid");
+            return nullptr;
+        }
+
+        if (merge_target_device->get_source_disabled()) {
+            _MSG_ERROR("Incoming remote connection for source '{}' matches existing source '{}', "
+                    "which has been disabled.  Re-open the source to accept the remote connection.",
+                    in_uuid.uuid_to_string(), merge_target_device->get_source_name());
+            incoming->trigger_error("source disabled");
             return nullptr;
         }
 
@@ -1752,13 +1801,14 @@ std::shared_ptr<kis_datasource> datasource_tracker::open_remote_datasource(dst_i
             // Make a data source from the builder
             shared_datasource ds = b->build_datasource(b);
             ds->connect_remote(in_definition, incoming, in_uuid, connect_tcp,
-                [this, ds, in_uuid](unsigned int, bool success, std::string msg) {
+                [this, ds](unsigned int, bool success, std::string msg) {
                     if (success) {
-                        _MSG_INFO("New remote source {} ({}) connected", ds->get_source_name(), in_uuid);
+                        _MSG_INFO("New remote source {} ({}) connected", ds->get_source_name(),
+                                ds->get_source_uuid());
                         merge_source(ds);
                     } else {
                         _MSG_ERROR("Error connecting new remote source {} ({}) - {}",
-                                ds->get_source_name(), in_uuid, msg);
+                                ds->get_source_name(), ds->get_source_uuid(), msg);
                         broken_source_vec.push_back(ds);
                     }
                 });
@@ -1832,7 +1882,7 @@ public:
 
     virtual void finalize() {
         if (target_sources.size() <= 1) {
-            initial_ds->set_channel_hop(defaults->get_hop_rate(),
+            initial_ds->set_channel_hop(dst->definition_hop_rate(initial_ds),
                     initial_ds->get_source_hop_vec(),
                     defaults->get_random_channel_order(),
                     0, 0, NULL);
@@ -1850,23 +1900,7 @@ public:
 
             int ds_offt = (ds_hopchans->size() / offt_count) * nintf;
 
-            double rate = defaults->get_hop_rate();
-
-            if (ds->get_definition_opt("channel_hoprate") != "") {
-                try {
-                    rate = dst->string_to_rate(ds->get_definition_opt("channel_hoprate"), -1);
-                } catch (const std::exception& e) {
-                    _MSG_ERROR("Source '{}' could not parse channel_hoprate= option: {}, using default "
-                            "channel rate.", ds->get_source_name(), e.what());
-                    rate = -1;
-                }
-            }
-
-            if (rate < 0) {
-                rate = defaults->get_hop_rate();
-            }
-
-            ds->set_channel_hop(rate, ds_hopchans, defaults->get_random_channel_order(),
+            ds->set_channel_hop(dst->definition_hop_rate(ds), ds_hopchans, defaults->get_random_channel_order(),
                     ds_offt, 0, NULL);
 
             nintf++;
@@ -1887,6 +1921,10 @@ protected:
 };
 
 void datasource_tracker::calculate_source_hopping(shared_datasource in_ds) {
+    // Failed sources are merged so they can be re-opened, but there's nothing to configure
+    if (!in_ds->get_source_running())
+        return;
+
     if (!in_ds->get_definition_opt_bool("channel_hop", true)) {
         // Source doesn't hop regardless of defaults
         return;
@@ -1900,12 +1938,38 @@ void datasource_tracker::calculate_source_hopping(shared_datasource in_ds) {
             dst_chansplit_worker worker(this, config_defaults, in_ds);
             iterate_datasources(&worker);
         } else {
-            in_ds->set_channel_hop(config_defaults->get_hop_rate(),
+            in_ds->set_channel_hop(definition_hop_rate(in_ds),
                     in_ds->get_source_hop_vec(),
                     config_defaults->get_random_channel_order(),
                     0, 0, NULL);
         }
     }
+}
+
+double datasource_tracker::definition_hop_rate(shared_datasource in_ds) {
+    auto opt = in_ds->get_definition_opt("channel_hoprate");
+
+    if (opt == "")
+        return config_defaults->get_hop_rate();
+
+    double rate;
+
+    try {
+        rate = string_to_rate(opt, -1);
+    } catch (const std::exception& e) {
+        _MSG_ERROR("Source '{}' could not parse channel_hoprate= option: {}, using default "
+                "channel rate.", in_ds->get_source_name(), e.what());
+        return config_defaults->get_hop_rate();
+    }
+
+    // 0/sec or 0/dwell (infinite) would leave the source not hopping at all
+    if (!std::isfinite(rate) || rate <= 0) {
+        _MSG_ERROR("Source '{}' channel_hoprate={} is not a usable hop rate, using default "
+                "channel rate.", in_ds->get_source_name(), opt);
+        return config_defaults->get_hop_rate();
+    }
+
+    return rate;
 }
 
 double datasource_tracker::string_to_rate(std::string in_str, double in_default) {
@@ -2042,9 +2106,17 @@ void dst_incoming_remote::handle_packet_newsource_v3(uint32_t in_seqno, uint16_t
     auto type_s = mpack_node_str(type_n);
     auto type_sz = mpack_node_data_len(type_n);
 
-    auto uuid_n = mpack_node_map_uint(root, KIS_EXTERNAL_V3_KDS_NEWSOURCE_FIELD_UUID);
-    auto uuid_s = mpack_node_str(uuid_n);
-    auto uuid_sz = mpack_node_data_len(uuid_n);
+    // The UUID is optional; sources which only learn it when opening report it then
+    auto uuid_n = mpack_node_map_uint_optional(root, KIS_EXTERNAL_V3_KDS_NEWSOURCE_FIELD_UUID);
+    uuid u;
+
+    if (!mpack_node_is_missing(uuid_n)) {
+        auto uuid_s = mpack_node_str(uuid_n);
+        auto uuid_sz = mpack_node_data_len(uuid_n);
+
+        if (mpack_tree_error(&tree) == mpack_ok)
+            u = uuid(std::string(uuid_s, uuid_sz));
+    }
 
     if (mpack_tree_error(&tree)) {
         _MSG_ERROR("Could not process incoming remote datasource announcement");
@@ -2054,7 +2126,6 @@ void dst_incoming_remote::handle_packet_newsource_v3(uint32_t in_seqno, uint16_t
 
     auto definition = std::string(definition_s, definition_sz);
     auto srctype = std::string(type_s, type_sz);
-    auto u = uuid(std::string(uuid_s, uuid_sz));
 
     if (cb != NULL) {
         cb(this, srctype, definition, u);

@@ -24,8 +24,11 @@
 #include <time.h>
 
 #include <algorithm>
+#include <array>
 #include <list>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -482,6 +485,17 @@ public:
             __ImportId(wps_serial_number_id, p);
             __ImportId(wps_uuid_e_id, p);
 
+            __ImportId(airmax_variant_id, p);
+            __ImportId(airmax_version_id, p);
+            __ImportId(airmax_radioname_id, p);
+            __ImportId(airmax_ssid_id, p);
+            __ImportId(airmax_fwname_id, p);
+            __ImportId(airmax_txpower_id, p);
+            __ImportId(airmax_tx_chainmask_id, p);
+            __ImportId(airmax_rx_chainmask_id, p);
+            __ImportId(airmax_cap_flags_id, p);
+            __ImportId(mikrotik_device_name_id, p);
+
             reserve_fields(nullptr);
         }
 
@@ -557,6 +571,24 @@ public:
     __ProxyFullyDynamic(wps_serial_number, std::string, std::string, std::string, tracker_element_string, wps_serial_number_id);
     __ProxyFullyDynamic(wps_uuid_e, std::string, std::string, std::string, tracker_element_byte_array, wps_uuid_e_id);
 
+    __ProxyFullyDynamic(airmax_variant, std::string, std::string, std::string, tracker_element_string,
+            airmax_variant_id);
+    __ProxyFullyDynamic(airmax_version, uint16_t, uint16_t, uint16_t, tracker_element_uint16, airmax_version_id);
+    __ProxyFullyDynamic(airmax_radioname, std::string, std::string, std::string, tracker_element_string,
+            airmax_radioname_id);
+    __ProxyFullyDynamic(airmax_ssid, std::string, std::string, std::string, tracker_element_string, airmax_ssid_id);
+    __ProxyFullyDynamic(airmax_fwname, std::string, std::string, std::string, tracker_element_string,
+            airmax_fwname_id);
+    __ProxyFullyDynamic(airmax_txpower, uint8_t, uint8_t, uint8_t, tracker_element_uint8, airmax_txpower_id);
+    __ProxyFullyDynamic(airmax_tx_chainmask, uint8_t, uint8_t, uint8_t, tracker_element_uint8,
+            airmax_tx_chainmask_id);
+    __ProxyFullyDynamic(airmax_rx_chainmask, uint8_t, uint8_t, uint8_t, tracker_element_uint8,
+            airmax_rx_chainmask_id);
+    __ProxyFullyDynamic(airmax_cap_flags, uint32_t, uint32_t, uint32_t, tracker_element_uint32,
+            airmax_cap_flags_id);
+    __ProxyFullyDynamic(mikrotik_device_name, std::string, std::string, std::string, tracker_element_string,
+            mikrotik_device_name_id);
+
 protected:
     virtual void register_fields() override;
 
@@ -592,6 +624,18 @@ protected:
     uint16_t wps_model_number_id;
     uint16_t wps_serial_number_id;
     uint16_t wps_uuid_e_id;
+
+    // Ubiquiti AirMAX and MikroTik vendor IEs
+    uint16_t airmax_variant_id;
+    uint16_t airmax_version_id;
+    uint16_t airmax_radioname_id;
+    uint16_t airmax_ssid_id;
+    uint16_t airmax_fwname_id;
+    uint16_t airmax_txpower_id;
+    uint16_t airmax_tx_chainmask_id;
+    uint16_t airmax_rx_chainmask_id;
+    uint16_t airmax_cap_flags_id;
+    uint16_t mikrotik_device_name_id;
 };
 
 /* Advertised SSID
@@ -669,6 +713,7 @@ public:
             __ImportId(wps_model_number_id, p);
             __ImportId(wps_serial_number_id, p);
             __ImportId(wps_uuid_e_id, p);
+            __ImportId(wps_broadcom_id, p);
 
             __ImportId(location_id, p);
 
@@ -694,6 +739,15 @@ public:
             __ImportId(mesh_forwarding_id, p);
 
             __ImportField(adv_tx_power, p);
+
+            __ImportId(airmax_variant_id, p);
+            __ImportId(airmax_version_id, p);
+            __ImportId(airmax_radioname_id, p);
+            __ImportId(airmax_ssid_id, p);
+            __ImportId(airmax_radio_mac_id, p);
+            __ImportId(airmax_cap_flags_id, p);
+            __ImportId(airmax_mixed_mode_id, p);
+            __ImportId(mikrotik_device_name_id, p);
 
             reserve_fields(nullptr);
         }
@@ -813,6 +867,11 @@ public:
             wps_serial_number_id);
     __ProxyFullyDynamic(wps_uuid_e, std::string, std::string, std::string, tracker_element_string,
             wps_uuid_e_id);
+    __ProxyFullyDynamic(wps_broadcom, uint8_t, uint8_t, uint8_t, tracker_element_uint8, wps_broadcom_id);
+
+    // Highest wps_broadcom level BCMWPSMONITOR has been raised for, so a rate limited
+    // alert is retried; not serialized
+    uint8_t wps_broadcom_alerted = 0;
 
     __ProxyFullyDynamicTrackable(location, kis_tracked_location, location_id);
 
@@ -838,6 +897,21 @@ public:
     __ProxyFullyDynamic(mesh_forwarding, uint8_t, bool, bool, tracker_element_uint8, mesh_forwarding_id);
 
     __Proxy(adv_tx_power, uint8_t, uint8_t, uint8_t, adv_tx_power);
+
+    __ProxyFullyDynamic(airmax_variant, std::string, std::string, std::string, tracker_element_string,
+            airmax_variant_id);
+    __ProxyFullyDynamic(airmax_version, uint16_t, uint16_t, uint16_t, tracker_element_uint16, airmax_version_id);
+    __ProxyFullyDynamic(airmax_radioname, std::string, std::string, std::string, tracker_element_string,
+            airmax_radioname_id);
+    __ProxyFullyDynamic(airmax_ssid, std::string, std::string, std::string, tracker_element_string, airmax_ssid_id);
+    __ProxyFullyDynamic(airmax_radio_mac, mac_addr, mac_addr, mac_addr, tracker_element_mac_addr,
+            airmax_radio_mac_id);
+    __ProxyFullyDynamic(airmax_cap_flags, uint32_t, uint32_t, uint32_t, tracker_element_uint32,
+            airmax_cap_flags_id);
+    __ProxyFullyDynamic(airmax_mixed_mode, uint32_t, uint32_t, uint32_t, tracker_element_uint32,
+            airmax_mixed_mode_id);
+    __ProxyFullyDynamic(mikrotik_device_name, std::string, std::string, std::string, tracker_element_string,
+            mikrotik_device_name_id);
 
 protected:
     virtual void register_fields() override;
@@ -918,6 +992,7 @@ protected:
     uint16_t wps_model_number_id;
     uint16_t wps_serial_number_id;
     uint16_t wps_uuid_e_id;
+    uint16_t wps_broadcom_id;
 
     uint16_t location_id;
 
@@ -952,6 +1027,16 @@ protected:
     uint16_t mesh_forwarding_id;
 
     std::shared_ptr<tracker_element_uint8> adv_tx_power;
+
+    // Ubiquiti AirMAX and MikroTik vendor IEs
+    uint16_t airmax_variant_id;
+    uint16_t airmax_version_id;
+    uint16_t airmax_radioname_id;
+    uint16_t airmax_ssid_id;
+    uint16_t airmax_radio_mac_id;
+    uint16_t airmax_cap_flags_id;
+    uint16_t airmax_mixed_mode_id;
+    uint16_t mikrotik_device_name_id;
 };
 
 /* dot11 client
@@ -1144,6 +1229,37 @@ protected:
 // Device has responded to probes, looking like an AP
 #define DOT11_DEVICE_TYPE_PROBE_AP          (1 << 8)
 
+// The last beacon or probe response of a BSSID without a channel switch announcement, to
+// compare the TSF of announcements with
+struct dot11_beacon_ref {
+    uint64_t tsf = 0;
+    int seq = -1;
+    uint64_t time_us = 0;
+    int interval = 0;
+    // The AP repeats its TSF in its own beacons, so the TSF checks don't apply.  It takes
+    // several repeats in a row, and an advancing TSF clears it, so one copied beacon from a
+    // spoofer can't turn the checks off.
+    static constexpr unsigned int tsf_repeats_unreliable = 3;
+    unsigned int tsf_repeats = 0;
+    bool tsf_unreliable = false;
+};
+
+// Channel switch state of a BSSID for spotting spoofed announcements; fixed size
+struct dot11_csa_state {
+    // The newest announcement by TSF from a beacon or probe response
+    bool valid = false;
+    uint64_t tsf = 0;
+    uint8_t count = 0;
+    uint8_t new_channel = 0;
+    uint8_t op_class = 0;
+    uint8_t cur_channel = 0;
+
+    // The last announcing frames (TSF, sequence number), for exact TSF repeats
+    static constexpr size_t recent_max = 4;
+    std::array<std::pair<uint64_t, int>, recent_max> recent{};
+    size_t recent_pos = 0;
+};
+
 // Dot11 device
 //
 // Device-level data, additional data stored in the client and ssid arrays
@@ -1158,6 +1274,9 @@ public:
         bss_invalid_count = 0;
         snapshot_next_beacon = false;
 
+		csa_count = 0;
+		last_csa_time = 0;
+
         register_fields();
         reserve_fields(NULL);
     }
@@ -1169,6 +1288,9 @@ public:
         last_bss_invalid = 0;
         bss_invalid_count = 0;
         snapshot_next_beacon = false;
+
+		csa_count = 0;
+		last_csa_time = 0;
 
         register_fields();
         reserve_fields(NULL);
@@ -1182,6 +1304,9 @@ public:
         bss_invalid_count = 0;
         snapshot_next_beacon = false;
 
+		csa_count = 0;
+		last_csa_time = 0;
+
         register_fields();
         reserve_fields(e);
     }
@@ -1193,6 +1318,9 @@ public:
             last_bss_invalid = 0;
             bss_invalid_count = 0;
             snapshot_next_beacon = false;
+
+			csa_count = 0;
+			last_csa_time = 0;
 
             __ImportField(type_set, p);
 
@@ -1370,6 +1498,15 @@ public:
 
     uint32_t get_last_adv_ie_csum() { return last_adv_ie_csum; }
     void set_last_adv_ie_csum(uint32_t csum) { last_adv_ie_csum = csum; }
+    dot11_beacon_ref& beacon_ref() { return beacon_ref_; }
+
+    // Allocated with the first channel switch announcement of the BSSID
+    dot11_csa_state& csa_state() {
+        if (csa_state_ == nullptr)
+            csa_state_ = std::make_unique<dot11_csa_state>();
+        return *csa_state_;
+    }
+    dot11_csa_state *csa_state_if_any() { return csa_state_.get(); }
     std::shared_ptr<dot11_advertised_ssid> get_last_adv_ssid() {
         return last_adv_ssid;
     }
@@ -1377,31 +1514,27 @@ public:
         last_adv_ssid = adv_ssid;
     }
 
+    // Serializers share the device lock, so the maps can't change and concurrent serializers
+    // compute the same counts; only the first one to take the stripe lock writes them
     virtual void pre_serialize() override {
-        if (client_map != nullptr)
-            set_num_client_aps(client_map->size());
-        else
-            set_num_client_aps(0);
+        const uint64_t n_client_aps = client_map != nullptr ? client_map->size() : 0;
+        const uint64_t n_adv = advertised_ssid_map != nullptr ? advertised_ssid_map->size() : 0;
+        const uint64_t n_resp = responded_ssid_map != nullptr ? responded_ssid_map->size() : 0;
+        const uint64_t n_probed = probed_ssid_map != nullptr ? probed_ssid_map->size() : 0;
+        const uint64_t n_assoc = associated_client_map != nullptr ? associated_client_map->size() : 0;
 
-        if (advertised_ssid_map != nullptr)
-            set_num_advertised_ssids(advertised_ssid_map->size());
-        else
-            set_num_advertised_ssids(0);
+        std::lock_guard<std::mutex> lk(serialize_count_mutex(this));
 
-        if (responded_ssid_map != nullptr)
-            set_num_responded_ssids(responded_ssid_map->size());
-        else
-            set_num_responded_ssids(0);
-
-        if (probed_ssid_map != nullptr)
-            set_num_probed_ssids(probed_ssid_map->size());
-        else
-            set_num_probed_ssids(0);
-
-        if (associated_client_map != nullptr)
-            set_num_associated_clients(associated_client_map->size());
-        else
-            set_num_associated_clients(0);
+        if (get_num_client_aps() != n_client_aps)
+            set_num_client_aps(n_client_aps);
+        if (get_num_advertised_ssids() != n_adv)
+            set_num_advertised_ssids(n_adv);
+        if (get_num_responded_ssids() != n_resp)
+            set_num_responded_ssids(n_resp);
+        if (get_num_probed_ssids() != n_probed)
+            set_num_probed_ssids(n_probed);
+        if (get_num_associated_clients() != n_assoc)
+            set_num_associated_clients(n_assoc);
     }
 
     __Proxy(min_tx_power, uint8_t, unsigned int, unsigned int, min_tx_power);
@@ -1431,7 +1564,22 @@ public:
     __ProxyDynamicTrackable(last_probed_ssid_record, tracker_element_alias,
             last_probed_ssid_record, last_probed_ssid_record_id);
 
+	constexpr auto csa_event_count() const {
+		return csa_count;
+	}
+
+	void inc_csa_event(uint64_t v, time_t t, unsigned int window) {
+		if (t - last_csa_time < window) {
+			csa_count += v;
+		} else {
+			csa_count = v;
+			last_csa_time = t;
+		}
+	}
+
 protected:
+    // Striped locks for publishing the serialized counts
+    static std::mutex& serialize_count_mutex(const dot11_tracked_device *dev);
 
     virtual void register_fields() override {
         register_field("dot11.device.typeset", "bitset of device type", &type_set);
@@ -1676,6 +1824,12 @@ protected:
     std::shared_ptr<tracker_element_uint64> num_associated_clients;
     std::shared_ptr<tracker_element_uint64> client_disconnects;
     std::shared_ptr<tracker_element_uint64> client_disconnects_last;
+
+	uint16_t csa_count;
+	time_t last_csa_time;
+
+    dot11_beacon_ref beacon_ref_;
+    std::unique_ptr<dot11_csa_state> csa_state_;
 
     // std::shared_ptr<tracker_element_uint64> last_sequence;
     std::shared_ptr<tracker_element_uint64> bss_timestamp;

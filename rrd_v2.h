@@ -25,6 +25,7 @@
 
 #include <array>
 
+#include "globalregistry.h"
 #include "json_adapter_v2.h"
 #include "kis_mutex.h"
 
@@ -59,6 +60,60 @@ public:
     }
 };
 
+// Samples in the same second add up (packets or bytes per second); the
+// minutes and hours are the mean of their seconds and minutes, so every
+// level reads as a per-second rate
+class kis_rrd_v2_sum_aggregator {
+public:
+    template<class InputIt>
+    static double combine(InputIt first, InputIt last) {
+        return kis_rrd_v2_default_aggregator::combine(first, last);
+    }
+
+    static double combine(double v, size_t sz) {
+        return v / sz;
+    }
+
+    static double combine(double v1, double v2) {
+        return v1 + v2;
+    }
+
+    static double default_value() {
+        return (double) 0;
+    }
+
+    static std::string name() {
+        return "sum";
+    }
+};
+
+// Samples in the same second keep the largest (a count taken once a second,
+// which an empty sample at serialization must not reduce); minutes and hours
+// are the mean
+class kis_rrd_v2_peak_aggregator {
+public:
+    template<class InputIt>
+    static double combine(InputIt first, InputIt last) {
+        return kis_rrd_v2_default_aggregator::combine(first, last);
+    }
+
+    static double combine(double v, size_t sz) {
+        return v / sz;
+    }
+
+    static double combine(double v1, double v2) {
+        return v1 > v2 ? v1 : v2;
+    }
+
+    static double default_value() {
+        return (double) 0;
+    }
+
+    static std::string name() {
+        return "peak";
+    }
+};
+
 template <class M_Aggregator = kis_rrd_v2_default_aggregator,
          class H_Aggregator = M_Aggregator,
          class D_Aggregator = M_Aggregator>
@@ -84,6 +139,28 @@ public:
         m_array{std::move(r.m_array)},
         h_array{std::move(r.h_array)},
         d_array{std::move(r.d_array)} { }
+
+	kis_rrd_v2& operator =(const kis_rrd_v2& op) {
+		update_first = op.update_first;
+		last_time = op.last_time;
+		serial_time = op.serial_time;
+		last_value = op.last_value;
+		last_value_n1 = op.last_value_n1;
+		m_array = op.m_array;
+		h_array = op.h_array;
+		d_array = op.d_array;
+	}
+
+	void reset() {
+		update_first = 0;
+		last_time = 0;
+		serial_time = 0;
+		last_value = M_Aggregator::default_value();
+		last_value_n1 = M_Aggregator::default_value();
+		m_array.fill(M_Aggregator::default_value());
+		h_array.fill(M_Aggregator::default_value());
+		d_array.fill(M_Aggregator::default_value());
+	}
 
     // Add a sample.  Use combinator function 'c' to derive the new sample value
     void add_sample(double in_s, time_t in_time) {
@@ -164,7 +241,7 @@ public:
                     d_array[(last_hour_bucket + 1 + h) % 24] = M_Aggregator::default_value();
                 }
 
-                d_array[hour_bucket] = min_val;
+                d_array[hour_bucket] = D_Aggregator::combine(min_val, h_array.size());
             } else if (in_time - ltime > 60) {
                 // - Calculate the average seconds
                 // - Wipe the seconds
@@ -210,30 +287,95 @@ public:
         last_time = in_time;
     }
 
-    virtual void as_json(std::ostream& os, json_adapter_v2::opts *opts) override {
-        // TODO handle field simplification, pretty printing
+	virtual void pre_serialize() override {
+		serial_time = Globalreg::globalreg->last_tv_sec;
+
+		if (update_first) {
+			add_sample(M_Aggregator::default_value(), serial_time);
+		}
+	}
+
+    virtual void filtered_as_json(std::ostream& os, json_adapter_v2::opts *opts, const json_adapter_v2::field_group_map& fields) override {
+        if (fields.size() == 0) {
+            return as_json(os, opts);
+        }
 
         auto lg = kis_lock_guard(mutex, __func__);
+
+		pre_serialize();
 
         auto sv_comma = opts->next_key_comma;
         opts->next_key_comma = false;
 
         fmt::print(os, "{{");
 
-        json_adapter_v2::encode_keyed(os, "kismet.common.rrd.last_time", opts, last_time);
-        json_adapter_v2::encode_keyed(os, "kismet.common.rrd.serial_time", opts, serial_time);
-        json_adapter_v2::encode_keyed(os, "kismet.common.rrd.last_value", opts, last_value);
-        json_adapter_v2::encode_keyed(os, "kismet.common.rrd.last_value_n1", opts, last_value_n1);
+        for (const auto& f : fields) {
+            switch (json_adapter_v2::consthash(f.first)) {
+                case json_adapter_v2::consthash("kismet.common.rrd.last_time"):
+                    json_adapter_v2::json_encode_keyed<uint64_t>{}(os, f.second.rename, opts, last_time);
+                    break;
+                case json_adapter_v2::consthash("kismet.common.rrd.serial_time"):
+                    json_adapter_v2::json_encode_keyed<uint64_t>{}(os, f.second.rename, opts, serial_time);
+                    break;
+                case json_adapter_v2::consthash("kismet.common.rrd.last_value"):
+                    json_adapter_v2::json_encode_keyed<double>{}(os, f.second.rename, opts, last_value);
+                    break;
+                case json_adapter_v2::consthash("kismet.common.rrd.last_value_n1"):
+                    json_adapter_v2::json_encode_keyed<double>{}(os, f.second.rename, opts, last_value_n1);
+                    break;
+                case json_adapter_v2::consthash("kismet.common.rrd.minute_vec"):
+                    json_adapter_v2::json_encode_keyed_array<hm_iter_t>{}(os, f.second.rename, opts, m_array.begin(), m_array.end());
+                    break;
+                case json_adapter_v2::consthash("kismet.common.rrd.hour_vec"):
+                    json_adapter_v2::json_encode_keyed_array<hm_iter_t>{}(os, f.second.rename, opts, h_array.begin(), h_array.end());
+                    break;
+                case json_adapter_v2::consthash("kismet.common.rrd.day_vec"):
+                    json_adapter_v2::json_encode_keyed_array<d_iter_t>{}(os, f.second.rename, opts, d_array.begin(), d_array.end());
+                    break;
+                case json_adapter_v2::consthash("kismet.common.rrd.blank_val"):
+                    json_adapter_v2::json_encode_keyed<double>{}(os, f.second.rename, opts, M_Aggregator::default_value());
+                    break;
+                default:
+                    json_adapter_v2::json_encode_keyed<int>{}(os, f.second.rename, opts, 0);
+                    break;
 
-        json_adapter_v2::encode_keyed(os, "kismet.common.rrd.minute_vec", opts, m_array.begin(), m_array.end());
-        json_adapter_v2::encode_keyed(os, "kismet.common.rrd.hour_vec", opts, h_array.begin(), h_array.end());
-        json_adapter_v2::encode_keyed(os, "kismet.common.rrd.day_vec", opts, d_array.begin(), d_array.end());
-
-        json_adapter_v2::encode_keyed(os, "kismet.common.rrd.blank_val", opts, M_Aggregator::default_value());
+            }
+        }
 
         fmt::print(os, "}}");
 
         opts->next_key_comma = sv_comma;
+
+		post_serialize();
+    }
+
+    virtual void as_json(std::ostream& os, json_adapter_v2::opts *opts) override {
+        // TODO handle field simplification, pretty printing
+        auto lg = kis_lock_guard(mutex, __func__);
+
+		pre_serialize();
+
+        auto sv_comma = opts->next_key_comma;
+        opts->next_key_comma = false;
+
+        fmt::print(os, "{{");
+
+        json_adapter_v2::json_encode_keyed<uint64_t>{}(os, "kismet.common.rrd.last_time", opts, last_time);
+        json_adapter_v2::json_encode_keyed<uint64_t>{}(os, "kismet.common.rrd.serial_time", opts, serial_time);
+        json_adapter_v2::json_encode_keyed<double>{}(os, "kismet.common.rrd.last_value", opts, last_value);
+        json_adapter_v2::json_encode_keyed<double>{}(os, "kismet.common.rrd.last_value_n1", opts, last_value_n1);
+
+        json_adapter_v2::json_encode_keyed_array<hm_iter_t>{}(os, "kismet.common.rrd.minute_vec", opts, m_array.begin(), m_array.end());
+        json_adapter_v2::json_encode_keyed_array<hm_iter_t>{}(os, "kismet.common.rrd.hour_vec", opts, h_array.begin(), h_array.end());
+        json_adapter_v2::json_encode_keyed_array<d_iter_t>{}(os, "kismet.common.rrd.day_vec", opts, d_array.begin(), d_array.end());
+
+        json_adapter_v2::json_encode_keyed<double>{}(os, "kismet.common.rrd.blank_val", opts, M_Aggregator::default_value());
+
+        fmt::print(os, "}}");
+
+        opts->next_key_comma = sv_comma;
+
+		post_serialize();
     }
 
 protected:
@@ -289,9 +431,230 @@ protected:
     double last_value;
     double last_value_n1;
 
+    using hm_iter_t = std::array<double, 60>::iterator;
+    using d_iter_t = std::array<double, 24>::iterator;
+
     std::array<double, 60> m_array;
     std::array<double, 60> h_array;
     std::array<double, 24> d_array;
 };
+
+template<typename Agg> struct json_adapter_v2::json_encode<kis_rrd_v2<Agg>> {
+    void operator()(std::ostream& os, json_adapter_v2::opts *opts, kis_rrd_v2<Agg>& e) {
+        e.as_json(os, opts);
+    }
+
+    void operator()(std::ostream& os, json_adapter_v2::opts *opts, kis_rrd_v2<Agg> *e) {
+        e->as_json(os, opts);
+    }
+
+    void operator()(std::ostream& os, json_adapter_v2::opts *opts, kis_rrd_v2<Agg>& e,
+            json_adapter_v2::field_group_map& fields) {
+        e.filtered_as_json(os, opts, fields);
+    }
+
+    void operator()(std::ostream& os, json_adapter_v2::opts *opts, kis_rrd_v2<Agg> *e,
+            json_adapter_v2::field_group_map& fields) {
+        e->filtered_as_json(os, opts, fields);
+    }
+};
+
+template <class M_Aggregator = kis_rrd_v2_default_aggregator>
+class kis_minute_rrd_v2 : public json_adapter_v2::jsonable {
+public:
+    kis_minute_rrd_v2() :
+        update_first{true},
+        last_time{0},
+        serial_time{0},
+        last_value{M_Aggregator::default_value()},
+        last_value_n1{M_Aggregator::default_value()} {
+            m_array.fill(M_Aggregator::default_value());
+        }
+
+    kis_minute_rrd_v2(kis_minute_rrd_v2&& r) :
+        update_first{r.update_first},
+        last_time{r.last_time},
+        serial_time{r.serial_time},
+        last_value{r.last_value},
+        last_value_n1{r.last_value_n1},
+        m_array{std::move(r.m_array)} { }
+
+    // Add a sample.  Use combinator function 'c' to derive the new sample value
+    void add_sample(double in_s, time_t in_time) {
+        kis_lock_guard<kis_mutex> lk(mutex, "kis_tracked_rrd add_sample");
+
+        size_t sec_bucket = in_time % 60;
+
+        time_t ltime = last_time;
+
+        // The second slot for the last time
+        const size_t last_sec_bucket = ltime % 60;
+
+        last_value_n1 = last_value;
+        if (in_time == ltime) {
+            last_value = M_Aggregator::combine(last_value, in_s);
+        } else {
+            last_value = in_s;
+        }
+
+        // Allow backfilling w/in the past minute because packets might come out-of-order
+        if (in_time < ltime) {
+            if (ltime - in_time > 60)
+                return;
+
+            double v = m_array[sec_bucket];
+            m_array[sec_bucket] = M_Aggregator::combine(v, in_s);
+        } else {
+			if (in_time - ltime > 60) {
+                m_array.fill(M_Aggregator::default_value());
+                m_array[sec_bucket] = in_s;
+			} else {
+				if (in_time == ltime) {
+					double v = m_array[sec_bucket];
+					m_array[sec_bucket] = M_Aggregator::combine(v, in_s);
+				} else {
+                    for (size_t s = 0; s < minutes_different(last_sec_bucket + 1, sec_bucket); s++) {
+                        m_array[(last_sec_bucket + 1 + s) % m_array.size()] = M_Aggregator::default_value();
+                    }
+                    m_array[sec_bucket] = in_s;
+				}
+			}
+		}
+
+        last_time = in_time;
+    }
+
+	virtual void pre_serialize() override {
+		serial_time = Globalreg::globalreg->last_tv_sec;
+
+		if (update_first) {
+			add_sample(M_Aggregator::default_value(), serial_time);
+		}
+	}
+
+    virtual void filtered_as_json(std::ostream& os, json_adapter_v2::opts *opts, const json_adapter_v2::field_group_map& fields) override {
+        if (fields.size() == 0) {
+            return as_json(os, opts);
+        }
+
+        auto lg = kis_lock_guard(mutex, __func__);
+
+		pre_serialize();
+
+        auto sv_comma = opts->next_key_comma;
+        opts->next_key_comma = false;
+
+        fmt::print(os, "{{");
+
+        for (const auto& f : fields) {
+            switch (json_adapter_v2::consthash(f.first)) {
+                case json_adapter_v2::consthash("kismet.common.rrd.last_time"):
+                    json_adapter_v2::json_encode_keyed<uint64_t>{}(os, f.second.rename, opts, last_time);
+                    break;
+                case json_adapter_v2::consthash("kismet.common.rrd.serial_time"):
+                    json_adapter_v2::json_encode_keyed<uint64_t>{}(os, f.second.rename, opts, serial_time);
+                    break;
+                case json_adapter_v2::consthash("kismet.common.rrd.last_value"):
+                    json_adapter_v2::json_encode_keyed<double>{}(os, f.second.rename, opts, last_value);
+                    break;
+                case json_adapter_v2::consthash("kismet.common.rrd.last_value_n1"):
+                    json_adapter_v2::json_encode_keyed<double>{}(os, f.second.rename, opts, last_value_n1);
+                    break;
+                case json_adapter_v2::consthash("kismet.common.rrd.minute_vec"):
+                    json_adapter_v2::json_encode_keyed_array<hm_iter_t>{}(os, f.second.rename, opts, m_array.begin(), m_array.end());
+                    break;
+                case json_adapter_v2::consthash("kismet.common.rrd.blank_val"):
+                    json_adapter_v2::json_encode_keyed<double>{}(os, f.second.rename, opts, M_Aggregator::default_value());
+                    break;
+                default:
+                    json_adapter_v2::json_encode_keyed<int>{}(os, f.second.rename, opts, 0);
+                    break;
+
+            }
+        }
+
+        fmt::print(os, "}}");
+
+        opts->next_key_comma = sv_comma;
+
+		post_serialize();
+    }
+
+    virtual void as_json(std::ostream& os, json_adapter_v2::opts *opts) override {
+        // TODO handle field simplification, pretty printing
+        auto lg = kis_lock_guard(mutex, __func__);
+
+		pre_serialize();
+
+        auto sv_comma = opts->next_key_comma;
+        opts->next_key_comma = false;
+
+        fmt::print(os, "{{");
+
+        json_adapter_v2::json_encode_keyed<uint64_t>{}(os, "kismet.common.rrd.last_time", opts, last_time);
+        json_adapter_v2::json_encode_keyed<uint64_t>{}(os, "kismet.common.rrd.serial_time", opts, serial_time);
+        json_adapter_v2::json_encode_keyed<double>{}(os, "kismet.common.rrd.last_value", opts, last_value);
+        json_adapter_v2::json_encode_keyed<double>{}(os, "kismet.common.rrd.last_value_n1", opts, last_value_n1);
+
+        json_adapter_v2::json_encode_keyed_array<hm_iter_t>{}(os, "kismet.common.rrd.minute_vec", opts, m_array.begin(), m_array.end());
+
+        json_adapter_v2::json_encode_keyed<double>{}(os, "kismet.common.rrd.blank_val", opts, M_Aggregator::default_value());
+
+        fmt::print(os, "}}");
+
+        opts->next_key_comma = sv_comma;
+
+		post_serialize();
+    }
+
+protected:
+    constexpr size_t minutes_different(size_t m1, size_t m2) const {
+        m1 = m1 % 60;
+        m2 = m2 % 60;
+
+        if (m1 == m2) {
+            return 0;
+        } else if (m1 < m2) {
+            return m2 - m1;
+        } else {
+            return 60 - m1 + m2;
+        }
+    }
+
+    kis_mutex mutex;
+
+    M_Aggregator m_agg;
+
+    bool update_first;
+
+    time_t last_time, serial_time;
+
+    double last_value;
+    double last_value_n1;
+
+    using hm_iter_t = std::array<double, 60>::iterator;
+    std::array<double, 60> m_array;
+};
+
+template<typename Agg> struct json_adapter_v2::json_encode<kis_minute_rrd_v2<Agg>> {
+    void operator()(std::ostream& os, json_adapter_v2::opts *opts, kis_minute_rrd_v2<Agg>& e) {
+        e.as_json(os, opts);
+    }
+
+    void operator()(std::ostream& os, json_adapter_v2::opts *opts, kis_minute_rrd_v2<Agg> *e) {
+        e->as_json(os, opts);
+    }
+
+    void operator()(std::ostream& os, json_adapter_v2::opts *opts, kis_minute_rrd_v2<Agg>& e,
+            json_adapter_v2::field_group_map& fields) {
+        e.filtered_as_json(os, opts, fields);
+    }
+
+    void operator()(std::ostream& os, json_adapter_v2::opts *opts, kis_minute_rrd_v2<Agg> *e,
+            json_adapter_v2::field_group_map& fields) {
+        e->filtered_as_json(os, opts, fields);
+    }
+};
+
 
 #endif /* __RRD_V2_H__ */

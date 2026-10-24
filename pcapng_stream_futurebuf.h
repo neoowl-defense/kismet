@@ -82,7 +82,6 @@ public:
             packetchain = Globalreg::fetch_mandatory_global_as<packet_chain>();
             pack_comp_linkframe = packetchain->register_packet_component("LINKFRAME");
             pack_comp_datasrc = packetchain->register_packet_component("KISDATASRC");
-            pack_comp_gpsinfo = packetchain->register_packet_component("GPS");
             pack_comp_meta = packetchain->register_packet_component("JSON");
 
         }
@@ -132,10 +131,17 @@ public:
         total_lifetime_ft.wait();
     }
 
+    // Packets discarded because the buffer was over the backlog limit (non-blocking mode)
+    uint64_t get_dropped_packets() const {
+        return dropped_packets;
+    }
+
 protected:
     kis_mutex pcap_mutex;
 
     future_chainbuf *chainbuf;
+
+    std::atomic<uint64_t> dropped_packets{0};
 
     std::promise<void> total_lifetime_promise;
     std::future<void> total_lifetime_ft;
@@ -147,7 +153,7 @@ protected:
     fn_selector selector_cb;
 
     std::shared_ptr<packet_chain> packetchain;
-    int pack_comp_linkframe, pack_comp_datasrc, pack_comp_gpsinfo, pack_comp_meta;
+    int pack_comp_linkframe, pack_comp_datasrc, pack_comp_meta;
 
     // Map kismet internal interface ID + DLT hash to log interface ID
     std::unordered_map<unsigned int, unsigned int> datasource_id_map;
@@ -374,7 +380,6 @@ protected:
         kis_lock_guard<kis_mutex> lk(pcap_mutex, "pcapng_futurebuf pcapng_write_packet");
 
         auto datasrcinfo = in_packet->fetch<packetchain_comp_datasource>(pack_comp_datasrc);
-        auto gpsinfo = in_packet->fetch<kis_gps_packinfo>(pack_comp_gpsinfo);
         auto metablob = in_packet->fetch<packet_metablob>(pack_comp_meta);
 
         if (datasrcinfo == nullptr) {
@@ -408,14 +413,14 @@ protected:
         // Optionally we add the GPS option into the total length
         size_t gps_len = 0;
 
-        if (gpsinfo != nullptr && gpsinfo->fix >= 2) {
+        if (in_packet->gps_info.gps_info_ok && in_packet->gps_info.fix >= 2) {
             // GPS header
             gps_len = sizeof(kismet_pcapng_gps_chunk_t);
 
             // Always lat/lon, optionally alt
             gps_len += 8;
 
-            if (gpsinfo->fix > 2 && gpsinfo->alt != 0)
+            if (in_packet->gps_info.fix > 2 && in_packet->gps_info.alt != 0)
                 gps_len += 4;
 
             // Total additional size is custom option block including PEN, and padded custom data
@@ -439,8 +444,10 @@ protected:
         }
 
         // Allocate 4 bytes larger to hold the final length
-        if (!block_until(buf_sz + 4))
+        if (!block_until(buf_sz + 4)) {
+            dropped_packets++;
             return 0;
+        }
 
         pcapng_epb *epb;
         pcapng_option *opt;
@@ -520,7 +527,7 @@ protected:
             opt_offt += sizeof(pcapng_option_t) + PAD_TO_32BIT(gopt->option_length);
         }
 
-        if (gpsinfo != nullptr && gpsinfo->fix >= 2) {
+        if (in_packet->gps_info.gps_info_ok && in_packet->gps_info.fix >= 2) {
             auto gopt = reinterpret_cast<pcapng_custom_option_t *>(buf.get() + opt_offt);
 
             // Always lon and lat
@@ -529,7 +536,7 @@ protected:
             // lon/lat
             gps_len = 8;
 
-            if (gpsinfo->fix > 2 && gpsinfo->alt != 0) {
+            if (in_packet->gps_info.fix > 2 && in_packet->gps_info.alt != 0) {
                 gps_len += 4;
                 gps_fields |= PCAPNG_GPS_FLAG_ALT;
             }
@@ -550,16 +557,16 @@ protected:
             size_t field_data_offt = 0;
 
             auto f = reinterpret_cast<uint32_t *>(gps->gps_data + field_data_offt);
-            *f = double_to_fixed3_7(gpsinfo->lon);
+            *f = double_to_fixed3_7(in_packet->gps_info.lon);
             field_data_offt += 4;
 
             f = reinterpret_cast<uint32_t *>(gps->gps_data + field_data_offt);
-            *f = double_to_fixed3_7(gpsinfo->lat);
+            *f = double_to_fixed3_7(in_packet->gps_info.lat);
             field_data_offt += 4;
 
-            if (gpsinfo->fix > 2 && gpsinfo->alt != 0) {
+            if (in_packet->gps_info.fix > 2 && in_packet->gps_info.alt != 0) {
                 f = reinterpret_cast<uint32_t *>(gps->gps_data + field_data_offt);
-                *f = double_to_fixed6_4(gpsinfo->alt);
+                *f = double_to_fixed6_4(in_packet->gps_info.alt);
                 field_data_offt += 4;
             }
 
@@ -591,8 +598,10 @@ protected:
         // Total buffer size is header + data + options
         size_t buf_sz = sizeof(pcapng_epb) + PAD_TO_32BIT(in_data.size()) + sizeof(pcapng_option);
 
-        if (!block_until(buf_sz + 4))
+        if (!block_until(buf_sz + 4)) {
+            dropped_packets++;
             return 0;
+        }
 
         pcapng_epb *epb;
         pcapng_option *opt;
@@ -679,11 +688,15 @@ protected:
 template<typename fn_accept, typename fn_selector>
 class pcapng_stream_packetchain : public pcapng_stream_futurebuf<fn_accept, fn_selector> {
 public:
+    // Non-blocking by default: when the buffer is over backlog_sz, packets are dropped (and
+    // counted) instead of stalling the packet threads
     pcapng_stream_packetchain(future_chainbuf *buffer, 
             fn_accept accept_filter,
             fn_selector data_selector,
-            size_t backlog_sz) :
-        pcapng_stream_futurebuf<fn_accept, fn_selector>{buffer, accept_filter, data_selector, backlog_sz, false} { }
+            size_t backlog_sz,
+            bool block_for_write = false) :
+        pcapng_stream_futurebuf<fn_accept, fn_selector>{buffer, accept_filter, data_selector,
+            backlog_sz, block_for_write} { }
 
     virtual ~pcapng_stream_packetchain() {
         this->packetchain->remove_handler(packethandler_id, CHAINPOS_LOGGING);

@@ -55,6 +55,7 @@ gps_tracker::~gps_tracker() {
     // Globalreg::globalreg->packetchain->remove_handler(&kis_gpspack_hook, CHAINPOS_POSTCAP);
 
     timetracker->remove_timer(log_snapshot_timer);
+    timetracker->remove_timer(log_satellites_timer);
     timetracker->remove_timer(event_timer_id);
 }
 
@@ -67,17 +68,9 @@ void gps_tracker::trigger_deferred_startup() {
                 tracker_element_factory<tracker_element_uuid>(),
                 "UUID of GPS reporting location");
 
-    // Register the gps component
-    pack_comp_gps =
-        Globalreg::globalreg->packetchain->register_packet_component("GPS");
-    pack_comp_no_gps =
-        Globalreg::globalreg->packetchain->register_packet_component("NOGPS");
-
-    // Register the packet chain hook - deprecated, now handled in datasources
-    // Globalreg::globalreg->packetchain->register_handler(&kis_gpspack_hook, this, CHAINPOS_POSTCAP, -100);
-
     // Manage logging
     log_snapshot_timer = -1;
+    log_satellites_timer = -1;
 
     database_logging = 
         Globalreg::globalreg->kismet_config->fetch_opt_bool("kis_log_gps_track", true);
@@ -92,8 +85,19 @@ void gps_tracker::trigger_deferred_startup() {
         _MSG("GPS track logging disabled", MSGFLAG_INFO);
     }
 
+    // The satellites in view change slowly, and are much larger than a location
+    const auto sat_rate =
+        Globalreg::globalreg->kismet_config->fetch_opt_uint("kis_log_gps_satellites_rate", 30);
+
+    if (database_logging && sat_rate > 0) {
+        log_satellites_timer =
+            timetracker->register_timer(std::chrono::seconds(sat_rate), 1,
+                    [this](int) -> int { log_snapshot_satellites(); return 1; });
+    }
+
     // Register the built-in GPS drivers
     register_gps_builder(shared_gps_builder(new gps_serial_v3_builder()));
+    register_gps_builder(shared_gps_builder(new gps_nmea_v3_builder()));
     register_gps_builder(shared_gps_builder(new gps_tcp_v2_builder()));
     register_gps_builder(shared_gps_builder(new gps_gpsd_v3_builder()));
     register_gps_builder(shared_gps_builder(new gps_fake_builder()));
@@ -127,6 +131,7 @@ void gps_tracker::trigger_deferred_startup() {
                         auto gps = find_gps_by_id(pi->gps_id);
                         if (gps != nullptr) {
                             ue->set(gps->get_gps_uuid());
+                            gps->add_signal_report(*loctrip);
                         }
 
                         loctrip->set_location(pi->lat, pi->lon);
@@ -170,6 +175,8 @@ void gps_tracker::trigger_deferred_startup() {
                         loctrip->insert(ue);
                     }
 
+                    gps->add_signal_report(*loctrip);
+
                     return loctrip;
                 }, gpsmanager_mutex));
 
@@ -192,6 +199,8 @@ void gps_tracker::trigger_deferred_startup() {
                             loctrip->set_time_sec(pi->tv.tv_sec);
                             loctrip->set_time_usec(pi->tv.tv_usec);
                         }
+
+                        gps->add_signal_report(*loctrip);
 
                         ret->insert(gps->get_gps_uuid(), loctrip);
                     }
@@ -252,6 +261,7 @@ void gps_tracker::trigger_deferred_startup() {
                         auto gps = find_gps_by_id(pi->gps_id);
                         if (gps != nullptr) {
                             ue->set(gps->get_gps_uuid());
+                            gps->add_signal_report(*loctrip);
                         }
                         loctrip->set_location(pi->lat, pi->lon);
                         loctrip->set_alt(pi->alt);
@@ -289,13 +299,40 @@ void gps_tracker::log_snapshot_gps() {
         struct timeval tv;
         gettimeofday(&tv, NULL);
 
+        // The satellite list goes in its own, less frequent, snapshot
         std::stringstream ss;
-        Globalreg::globalreg->entrytracker->serialize("json", ss, d, NULL);
+        Globalreg::globalreg->entrytracker->serialize("json", ss, dg->track_snapshot(), NULL);
 
         dbf->log_snapshot(dg->get_location(), tv, "GPS", ss.str());
     }
 
     return;
+}
+
+void gps_tracker::log_snapshot_satellites() {
+    std::shared_ptr<kis_database_logfile> dbf =
+        Globalreg::fetch_global_as<kis_database_logfile>("DATABASELOG");
+
+    if (dbf == NULL)
+        return;
+
+    kis_lock_guard<kis_mutex> lk(gpsmanager_mutex, "gps_tracker log_snapshot_satellites");
+
+    for (auto d : *gps_instances_vec) {
+        auto dg = static_cast<kis_gps *>(d.get());
+        auto snap = dg->satellite_snapshot();
+
+        if (snap == nullptr)
+            continue;
+
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+
+        std::stringstream ss;
+        Globalreg::globalreg->entrytracker->serialize("json", ss, snap, NULL);
+
+        dbf->log_snapshot(dg->get_location(), tv, "GPSSATS", ss.str());
+    }
 }
 
 void gps_tracker::register_gps_builder(shared_gps_builder in_builder) {
@@ -415,23 +452,48 @@ std::string gps_tracker::find_next_name(const std::string& in_name) {
     return "ERROR";
 }
 
+void gps_tracker::trigger_deferred_shutdown() {
+    std::vector<shared_gps> all;
+
+    {
+        kis_lock_guard<kis_mutex> lk(gpsmanager_mutex, "gps_tracker shutdown");
+
+        if (gps_instances_vec == nullptr)
+            return;
+
+        for (const auto& g : *gps_instances_vec)
+            all.push_back(std::static_pointer_cast<kis_gps>(g));
+    }
+
+    for (const auto& g : all)
+        g->close_gps();
+}
+
 bool gps_tracker::remove_gps(uuid in_uuid) {
-    kis_lock_guard<kis_mutex> lk(gpsmanager_mutex, "remove_gps");
+    shared_gps removed;
 
-    if (gps_instances_vec == nullptr)
-        return false;
+    {
+        kis_lock_guard<kis_mutex> lk(gpsmanager_mutex, "remove_gps");
 
-    for (unsigned int i = 0; i < gps_instances_vec->size(); i++) {
-        auto gps = static_cast<kis_gps *>((*gps_instances_vec)[i].get());
+        if (gps_instances_vec == nullptr)
+            return false;
 
-        if (gps->get_gps_uuid() == in_uuid) {
-            gps_instances_vec->erase(gps_instances_vec->begin() + i);
+        for (unsigned int i = 0; i < gps_instances_vec->size(); i++) {
+            auto gps = std::static_pointer_cast<kis_gps>((*gps_instances_vec)[i]);
 
-            return true;
+            if (gps->get_gps_uuid() == in_uuid) {
+                gps_instances_vec->erase(gps_instances_vec->begin() + i);
+                removed = gps;
+                break;
+            }
         }
     }
 
-    return false;
+    // Otherwise a pending read keeps the device open and running
+    if (removed != nullptr)
+        removed->close_gps();
+
+    return removed != nullptr;
 }
 
 std::shared_ptr<kis_gps> gps_tracker::find_gps_by_id(uint64_t in_id) {
@@ -505,6 +567,29 @@ std::shared_ptr<kis_gps_packinfo> gps_tracker::get_best_location() {
     return nullptr;
 }
 
+void gps_tracker::get_best_location(kis_gps_packinfo& location) {
+    kis_lock_guard<kis_mutex> lk(gpsmanager_mutex, "get_best_location");
+
+    if (gps_instances_vec == nullptr) {
+		location.reset();
+		return;
+	}
+
+    for (const auto& d : *gps_instances_vec) {
+        auto gps = static_cast<kis_gps *>(d.get());
+
+        if (gps->get_gps_data_only())
+            continue;
+
+        if (gps->get_location_valid()) {
+			location.set(gps->get_location());
+			return;
+        }
+    }
+
+	location.reset();
+}
+
 int gps_tracker::kis_gpspack_hook(CHAINCALL_PARMS) {
     // We're an 'external user' of gps_tracker despite being inside it,
     // so don't do thread locking - that's up to gps_tracker internals
@@ -513,19 +598,15 @@ int gps_tracker::kis_gpspack_hook(CHAINCALL_PARMS) {
 
     // Don't override if this packet already has a location, which could
     // come from a drone or from a PPI file
-    if (in_pack->fetch(gpstracker->pack_comp_gps) != NULL)
-        return 1;
+	if (in_pack->gps_info.gps_info_ok) {
+		return 1;
+	}
 
-    if (in_pack->fetch(gpstracker->pack_comp_no_gps) != NULL)
-        return 1;
+	if (in_pack->suppress_gps) {
+		return 1;
+	}
 
-    auto gpsloc = gpstracker->get_best_location();
-
-    if (gpsloc == nullptr)
-        return 0;
-
-    // Insert into chain; we were given a new location
-    in_pack->insert(gpstracker->pack_comp_gps, std::move(gpsloc));
+	gpstracker->get_best_location(in_pack->gps_info);
 
     return 1;
 }

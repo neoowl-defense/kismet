@@ -37,11 +37,7 @@ datasource_scan_source::datasource_scan_source(const std::string& uri, const std
         packetchain->register_packet_component("JSON");
     pack_comp_datasrc =
         packetchain->register_packet_component("KISDATASRC");
-    pack_comp_gps = 
-        packetchain->register_packet_component("GPS");
-    pack_comp_l1info = 
-        packetchain->register_packet_component("RADIODATA");
-    pack_comp_devicetag = 
+    pack_comp_devicetag =
         packetchain->register_packet_component("DEVICETAG");
 
     auto httpd = Globalreg::fetch_mandatory_global_as<kis_net_beast_httpd>();
@@ -86,6 +82,7 @@ void datasource_scan_source::scan_result_endp_handler(std::shared_ptr<kis_net_be
         if (!reports_j.is_array()) {
             con->set_status(500);
             stream << "{\"status\": \"expected 'reports' array\", \"success\": false}\n";
+            return;
         }
 
         // Look up the source by either the uuid provided or the uuid we made based on the name
@@ -112,6 +109,7 @@ void datasource_scan_source::scan_result_endp_handler(std::shared_ptr<kis_net_be
 
         for (auto r : reports_j) {
             if (!validate_report(r)) {
+                virtual_source->inc_source_num_error_packets(1);
                 throw std::runtime_error("invalid report");
             }
 
@@ -156,48 +154,37 @@ void datasource_scan_source::scan_result_endp_handler(std::shared_ptr<kis_net_be
             double speed = r.value("speed", (double) 0);
 
             if (lat != 0 && lon != 0) {
-                auto gpsinfo = std::make_shared<kis_gps_packinfo>();
+                packet->gps_info.gps_info_ok = true;
 
-                gpsinfo->lat = lat;
-                gpsinfo->lon = lon;
-                
+                packet->gps_info.lat = lat;
+                packet->gps_info.lon = lon;
+
                 if (alt != 0)
-                    gpsinfo->fix = 3;
+                    packet->gps_info.fix = 3;
                 else
-                    gpsinfo->fix = 2;
+                    packet->gps_info.fix = 2;
 
-                gpsinfo->alt = alt;
-                gpsinfo->speed = speed;
-
-                packet->insert(pack_comp_gps, gpsinfo);
+                packet->gps_info.alt = alt;
+                packet->gps_info.speed = speed;
             }
 
-            std::shared_ptr<kis_layer1_packinfo> l1info;
+            // std::shared_ptr<kis_layer1_packinfo> l1info;
 
             if (!r["signal"].is_null()) {
-                if (l1info == nullptr)
-                    l1info = std::make_shared<kis_layer1_packinfo>();
-
-                l1info->signal_dbm = r["signal"];
-                l1info->signal_type = kis_l1_signal_type_dbm;
+                packet->signal_info.data_ok = true;
+                packet->signal_info.signal_dbm = r["signal"];
+                packet->signal_info.signal_type = kis_l1_signal_type_dbm;
             }
 
             if (!r["freqkhz"].is_null()) {
-                if (l1info == nullptr)
-                    l1info = std::make_shared<kis_layer1_packinfo>();
-
-                l1info->freq_khz = r["freqkhz"];
+                packet->signal_info.data_ok = true;
+                packet->signal_info.freq_khz = r["freqkhz"];
             }
 
             if (!r["channel"].is_null()) {
-                if (l1info == nullptr)
-                    l1info = std::make_shared<kis_layer1_packinfo>();
-
-                l1info->channel = r["channel"];
+                packet->signal_info.data_ok = true;
+                packet->signal_info.channel = r["channel"];
             }
-
-            if (l1info != nullptr)
-                packet->insert(pack_comp_l1info, l1info);
 
             auto srcinfo = std::make_shared<packetchain_comp_datasource>();
             srcinfo->ref_source = virtual_source.get();
@@ -207,8 +194,6 @@ void datasource_scan_source::scan_result_endp_handler(std::shared_ptr<kis_net_be
 
             // Null out our local packet, it's destroyed by packetchain
             packet = nullptr;
-
-            virtual_source->inc_source_num_packets(1);
         }
 
         stream << "{\"status\": \"Scan report accepted\", \"success\": true}\n";

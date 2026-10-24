@@ -82,27 +82,20 @@ void kis_datasource_linux_bluetooth::handle_packet_linuxbtdevice(uint32_t in_seq
     auto packet = packetchain->generate_packet();
 
     if (report.has_signal()) {
-        auto siginfo = handle_sub_signal(report.signal());
-        packet->insert(pack_comp_l1info, siginfo);
+        handle_sub_signal(report.signal(), packet->signal_info);
     }
 
     if (report.has_gps()) {
-        auto gpsinfo = handle_sub_gps(report.gps());
-        packet->insert(pack_comp_gps, gpsinfo);
+		handle_sub_gps(report.gps(), packet->gps_info);
     } else if (suppress_gps) {
-        auto nogpsinfo = packetchain->new_packet_component<kis_no_gps_packinfo>();
-        packet->insert(pack_comp_no_gps, nogpsinfo);
+		packet->suppress_gps = true;
     } else if (device_gps != nullptr) {
         auto gpsinfo = device_gps->get_location();
 
         if (gpsinfo != nullptr)
-            packet->insert(pack_comp_gps, gpsinfo);
+			packet->gps_info.set(gpsinfo);
     } else {
-        auto gpsloc = gpstracker->get_best_location();
-
-        if (gpsloc != nullptr) {
-            packet->insert(pack_comp_gps, std::move(gpsloc));
-        }
+		gpstracker->get_best_location(packet->gps_info);
     }
 
     if (clobber_timestamp && get_source_remote()) {
@@ -129,7 +122,6 @@ void kis_datasource_linux_bluetooth::handle_packet_linuxbtdevice(uint32_t in_seq
 
     packet->insert(pack_comp_datasrc, datasrcinfo);
 
-    inc_source_num_packets(1);
     get_source_packet_rrd()->add_sample(1, time(0));
 
     // Inject the packet into the packetchain if we have one

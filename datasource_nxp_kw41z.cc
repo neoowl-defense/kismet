@@ -20,7 +20,7 @@
 
 #include "datasource_nxp_kw41z.h"
 
-int kis_datasource_nxpkw41z::handle_rx_data_content(kis_packet *packet, 
+kis_datasource_nxpkw41z::rx_content kis_datasource_nxpkw41z::handle_rx_data_content(kis_packet *packet, 
         kis_datachunk *datachunk, const uint8_t *content, size_t content_sz) {
 
     typedef struct {
@@ -45,7 +45,7 @@ int kis_datasource_nxpkw41z::handle_rx_data_content(kis_packet *packet,
         // error, but preserve the packet for logging
         packet->set_data((const char *) content, content_sz);
         datachunk->set_data(packet->data);
-        return 1;
+        return rx_content::frame;
     }
 
 //we may have to redo the checksum...
@@ -73,46 +73,27 @@ int kis_datasource_nxpkw41z::handle_rx_data_content(kis_packet *packet,
             // error, but preserve the packet for logging
             packet->set_data((const char *) content, content_sz);
             datachunk->set_data(packet->data);
-            return 1;
+            return rx_content::frame;
         }
 
         // Copy the actual packet payload into the header
         memcpy(conv_header->payload, &content[11], nxp_payload_len);
 
-        conv_header->version = kis_htole16(0);// currently only one version
-        conv_header->reserved = kis_htole16(0);// must be set to 0
-
-         // fcs setting
-        conv_header->tlv[0].type = kis_htole16(0);
-        conv_header->tlv[0].length = kis_htole16(1);
-        conv_header->tlv[0].value = kis_htole32(0);
-
-        // rssi
-        conv_header->tlv[1].type = kis_htole16(10);
-        conv_header->tlv[1].length = kis_htole16(1);
-        conv_header->tlv[1].value = kis_htole32(rssi);
-
-        // channel
-        conv_header->tlv[2].type = kis_htole16(3);
-        conv_header->tlv[2].length = kis_htole16(3);
-        conv_header->tlv[2].value = kis_htole32(channel);
-
-        // size
-        conv_header->length = sizeof(_802_15_4_tap); 
+        // no FCS; the radio's level is a raw RSSI, not dBm, so it goes in the LQI TLV; the channel
+        tap_802_15_4_fill(conv_header, 0, 0, 0.0f, (uint8_t) (rssi > 255 ? 255 : rssi), channel);
 
         datachunk->dlt = KDLT_IEEE802_15_4_TAP;
 
         packet->set_data((const char *) conv_buf, conv_buf_len);
         datachunk->set_data(packet->data);
 
-        auto radioheader = packetchain->new_packet_component<kis_layer1_packinfo>();
-        radioheader->signal_type = kis_l1_signal_type_rssi;
-        radioheader->signal_rssi = rssi * -1;
+        packet->signal_info.data_ok = true;
+        packet->signal_info.signal_type = kis_l1_signal_type_rssi;
+        packet->signal_info.signal_rssi = rssi * -1;
         //radioheader->freq_khz = (2400 + (channel)) * 1000;
-        radioheader->channel = fmt::format("{}", (channel));
-        packet->insert(pack_comp_radiodata, radioheader);
+        packet->signal_info.channel = fmt::format("{}", (channel));
 
-        return 1;
+        return rx_content::frame;
     } else if (content[0] == 0x02 && content[1] == 0x4E && content[2] == 0x7F) {
         // Convert the channel for the btlell header
         auto bt_channel = content[5];
@@ -137,7 +118,7 @@ int kis_datasource_nxpkw41z::handle_rx_data_content(kis_packet *packet,
             // error, but preserve the packet for logging
             packet->set_data((const char *) content, content_sz);
             datachunk->set_data(packet->data);
-            return 1;
+            return rx_content::frame;
         }
 
         unsigned int nxp_payload_len = content_sz - 13;  // minus header and checksum
@@ -186,12 +167,11 @@ int kis_datasource_nxpkw41z::handle_rx_data_content(kis_packet *packet,
 
         // Generate a l1 radio header and a decap header since we have it
         // computed already
-        auto radioheader = packetchain->new_packet_component<kis_layer1_packinfo>();
-        radioheader->signal_type = kis_l1_signal_type_dbm;
-        radioheader->signal_dbm = conv_header->signal;
-        radioheader->freq_khz = (2400 + (channel)) * 1000;
-        radioheader->channel = fmt::format("{}", (channel));
-        packet->insert(pack_comp_radiodata, radioheader);
+		packet->signal_info.data_ok = true;
+        packet->signal_info.signal_type = kis_l1_signal_type_dbm;
+        packet->signal_info.signal_dbm = conv_header->signal;
+        packet->signal_info.freq_khz = (2400 + (channel)) * 1000;
+        packet->signal_info.channel = fmt::format("{}", (channel));
 
 
         auto decapchunk = packetchain->new_packet_component<kis_datachunk>();
@@ -199,12 +179,12 @@ int kis_datasource_nxpkw41z::handle_rx_data_content(kis_packet *packet,
         decapchunk->set_data(packet->data.substr(sizeof(btle_rf), nxp_payload_len));
         packet->insert(pack_comp_decap, decapchunk);
 
-        return 1;
+        return rx_content::frame;
     } else {
         packet->error = 1;
         // error, but preserve the packet for logging
         packet->set_data((const char *) content, content_sz);
         datachunk->set_data(packet->data);
-        return 1;
+        return rx_content::frame;
     }
 }

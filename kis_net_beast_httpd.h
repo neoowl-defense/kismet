@@ -421,6 +421,24 @@ public:
 
         return summarize_tracker_element(in_data, summary_vec, rename_map);
     }
+
+    // Convert JSON summarization to the new basic string/string pairing used in the v2 json model.
+    // May throw exceptions if malformed.
+    void extract_field_summary_v2(json_adapter_v2::raw_field_list& summary) {
+        const auto fields = json_["fields"];
+
+        if (!fields.is_null() && fields.is_array()) {
+            for (const auto& i : fields) {
+                if (i.is_string()) {
+                    summary.push_back(std::make_pair(i.get<std::string>(), ""));
+                } else if (i.is_array() && i.size() == 2) {
+                    summary.push_back(std::make_pair(i[0].get<std::string>(), i[1].get<std::string>()));
+                } else {
+                    throw std::runtime_error("invalid vield mapping, expected field or [field, name]");
+                }
+            }
+        }
+    }
 };
 
 
@@ -609,18 +627,35 @@ public:
         pre_func{pre_func},
         post_func{post_func} { }
 
+    kis_net_web_jsonable_endpoint(std::unique_ptr<json_adapter_v2::jsonable> content,
+            kis_mutex& mutex,
+            wrapper_func_t pre_func = nullptr,
+            wrapper_func_t post_func = nullptr) :
+        content{content.get()},
+        unique_content{std::move(content)},
+        mutex{mutex},
+        use_mutex{true},
+        pre_func{pre_func},
+        post_func{post_func} { }
+
     kis_net_web_jsonable_endpoint(json_adapter_v2::jsonable *content) :
         content{content},
+        mutex{dfl_mutex} { }
+
+    kis_net_web_jsonable_endpoint(std::unique_ptr<json_adapter_v2::jsonable> content) :
+        content{content.get()},
+        unique_content{std::move(content)},
         mutex{dfl_mutex} { }
 
     virtual void handle_request(std::shared_ptr<kis_net_beast_httpd_connection> con) override;
 
 protected:
-	json_adapter_v2::jsonable *content;
+    json_adapter_v2::jsonable *content;
+    std::unique_ptr<json_adapter_v2::jsonable> unique_content;
 
     kis_mutex& mutex;
     kis_mutex dfl_mutex;
-    bool use_mutex;
+    bool use_mutex{false};
 
     wrapper_func_t pre_func;
     wrapper_func_t post_func;
@@ -712,7 +747,8 @@ public:
     const time_t& accessed() { return time_accessed_; }
     const time_t& created() { return time_created_; }
 
-    bool is_valid() const { return time_expires_ == 0 || time_expires_ < time(0); }
+    // Valid if it never expires or has not expired yet
+    bool is_valid() const { return time_expires_ == 0 || time_expires_ > time(0); }
     void access() { time_accessed_ = time(0); }
     void set_expiration(time_t e) { time_expires_ = e; }
     void set_role(const std::string& r) { role_ = r; }

@@ -18,7 +18,7 @@
   GNU General Public License for more details.
 
   You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
 #define __GNU_SOURCE
@@ -216,6 +216,7 @@ int probe_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition
 
     /* Look for the interface type */
     if (strstr(interface, "mousejack") != interface) {
+        snprintf(msg, STATUS_MAX, "Didn't find a mousejack interface, skipping");
         free(interface);
         return 0;
     }
@@ -229,12 +230,22 @@ int probe_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition
 
     /* If we don't have a valid busno/devno or malformed interface name */
     if (x != -1 && x != 2) {
+        snprintf(msg, STATUS_MAX, "Could not find a valid bus or device path");
         return 0;
+    }
+
+    if (localnrf->libusb_ctx == NULL) {
+        r = libusb_init(&localnrf->libusb_ctx);
+        if (r < 0) {
+            snprintf(msg, STATUS_MAX, "nrf-mousejack: could not initalize libusb");
+            return 0;
+        }
     }
 
     libusb_devices_cnt = libusb_get_device_list(localnrf->libusb_ctx, &libusb_devs);
 
     if (libusb_devices_cnt < 0) {
+        snprintf(msg, STATUS_MAX, "Could not find any USB devices");
         return 0;
     }
 
@@ -311,6 +322,14 @@ int list_callback(kis_capture_handler_t *caph, uint32_t seqno,
     unsigned int i;
 
     local_nrf_t *localnrf = (local_nrf_t *) caph->userdata;
+
+    if (localnrf->libusb_ctx == NULL) {
+        r = libusb_init(&localnrf->libusb_ctx);
+        if (r < 0) {
+            snprintf(msg, STATUS_MAX, "nrf-mousejack: could not initalize libusb");
+            return 0;
+        }
+    }
 
     libusb_devices_cnt = libusb_get_device_list(localnrf->libusb_ctx, &libusb_devs);
 
@@ -419,6 +438,14 @@ int open_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition,
         snprintf(msg, STATUS_MAX, "Malformed mousejack interface, expected 'mousejack' or "
                 "'mousejack-bus#-dev#'"); 
         return -1;
+    }
+
+    if (localnrf->libusb_ctx == NULL) {
+        r = libusb_init(&localnrf->libusb_ctx);
+        if (r < 0) {
+            snprintf(msg, STATUS_MAX, "nrf-mousejack: could not initalize libusb");
+            return -1;
+        }
     }
 
     libusb_devices_cnt = libusb_get_device_list(localnrf->libusb_ctx, &libusb_devs);
@@ -671,11 +698,6 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
-    r = libusb_init(&localnrf.libusb_ctx);
-    if (r < 0) {
-        return -1;
-    }
-
     localnrf.caph = caph;
 
     /* Set the local data ptr */
@@ -718,7 +740,9 @@ int main(int argc, char *argv[]) {
 
     cf_handler_shutdown(caph);
 
-    libusb_exit(localnrf.libusb_ctx);
+    if (localnrf.libusb_ctx != NULL) {
+        libusb_exit(localnrf.libusb_ctx);
+    }
 
     return 0;
 }

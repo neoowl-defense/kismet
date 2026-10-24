@@ -52,6 +52,37 @@
 class kis_tracked_device;
 class device_tracker_view;
 
+// Scoped view lock; views are locked after devices and never held while locking a device
+class kis_view_lock {
+public:
+    kis_view_lock(kis_shared_mutex& m, bool shared) :
+        mutex{m},
+        shared{shared} {
+        if (shared)
+            mutex.lock_shared();
+        else
+            mutex.lock();
+
+        kis_view_locks_held++;
+    }
+
+    ~kis_view_lock() {
+        kis_view_locks_held--;
+
+        if (shared)
+            mutex.unlock_shared();
+        else
+            mutex.unlock();
+    }
+
+    kis_view_lock(const kis_view_lock&) = delete;
+    kis_view_lock& operator=(const kis_view_lock&) = delete;
+
+protected:
+    kis_shared_mutex& mutex;
+    bool shared;
+};
+
 class device_tracker_view : public tracker_component {
 public:
     // The new device callback is called whenever a new device is created by the devicetracker;
@@ -144,13 +175,31 @@ protected:
     new_device_cb new_cb;
     updated_device_cb update_cb;
 
+    // Protects device_list, device_presence_map, and list_sz
+    kis_shared_mutex view_mutex;
+
+    // Index into each device's view membership bits; views past the device capacity use
+    // the presence map under lock
+    unsigned int view_index;
+    static std::atomic<unsigned int> next_view_index;
+
+    bool tracks_membership_on_device() const {
+        return view_index < kis_tracked_device_base::view_membership_capacity;
+    }
+
+    // Record membership in both the presence map and the device; caller holds view_mutex
+    // exclusively
+    void set_present(const std::shared_ptr<kis_tracked_device_base>& device, bool present);
+
     // Main vector of devices
     std::shared_ptr<tracker_element_vector> device_list;
     // Map of device presence in our list for fast reference during updates
     std::unordered_map<device_key, bool> device_presence_map;
 
     void device_endpoint_handler(std::shared_ptr<kis_net_beast_httpd_connection> con);
-    std::shared_ptr<tracker_element> device_time_endpoint(std::shared_ptr<kis_net_beast_httpd_connection> con);
+    // Devices seen (last_time) or, with modified, changed (mod_time) since a timestamp
+    std::shared_ptr<tracker_element> device_time_endpoint(std::shared_ptr<kis_net_beast_httpd_connection> con,
+            bool modified);
 
     // Build the URLs
     void register_urls(const std::string& in_id);

@@ -124,6 +124,8 @@ public:
 
     virtual std::string remote_addresss() { return ""; }
 
+    virtual bool is_remote() { return true; }
+
     virtual boost::asio::io_context::strand &strand() { return strand_; }
 
     virtual void close() {
@@ -145,6 +147,22 @@ public:
 
     std::shared_ptr<boost::asio::streambuf> in_buf_;
     std::list<std::shared_ptr<std::string>> out_bufs_;
+
+    // Bytes read from the stream and not yet split into frames; reading everything
+    // available at once avoids an async read (and thread handoff) per frame
+    boost::asio::streambuf rx_buf_{MAX_EXTERNAL_FRAME_LEN * 64};
+
+    template <class S>
+    void read_frames(S& stream);
+
+    // Resume reading once the packet threads have caught up
+    boost::asio::steady_timer backlog_timer_{Globalreg::globalreg->io};
+    void read_after_backlog();
+
+    // Hand each complete frame in rx_buf_ to the interface; < 0 on error
+    int dispatch_frames();
+
+    void handle_read_error(const boost::system::error_code& ec);
 };
 
 class kis_external_ipc : public kis_external_io {
@@ -173,6 +191,7 @@ public:
     virtual void close() override;
 
     virtual std::string remote_addresss() override;
+    virtual bool is_remote() override { return false; }
 
     void close_impl();
 
@@ -205,6 +224,7 @@ public:
     void close_impl();
 
     virtual std::string remote_addresss() override;
+    virtual bool is_remote() override;
 
     tcp::socket tcpsocket_;
 };
@@ -237,6 +257,7 @@ public:
     virtual void close() override;
 
     virtual std::string remote_addresss() override;
+    virtual bool is_remote() override;
 
     std::shared_ptr<kis_net_web_websocket_endpoint> ws_;
     boost::asio::io_context::strand ws_strand_;
@@ -367,7 +388,7 @@ protected:
     unsigned int send_packet_v3(unsigned int command, uint32_t in_seqno,
             unsigned int code, const char *content, size_t content_sz) {
 
-        if ((io_ != nullptr && io_->stopped()) || cancelled) {
+        if (io_ == nullptr || io_->stopped() || cancelled) {
             _MSG_DEBUG("Attempt to send {} on closed external interface", command);
             return 0;
         }
@@ -417,7 +438,7 @@ protected:
     // Wrap a protobuf packet in a v2 header and transmit it, returning the sequence number
     template<class T>
     unsigned int send_packet_v2(const std::string& command, uint32_t in_seqno, const T& content) {
-        if ((io_ != nullptr && io_->stopped()) || cancelled) {
+        if (io_ == nullptr || io_->stopped() || cancelled) {
             _MSG_DEBUG("Attempt to send {} on closed external interface", command);
             return 0;
         }
@@ -553,6 +574,8 @@ protected:
     unsigned int send_v2_probe_ping();
     bool v2_probe_ack;
     virtual void handle_v2_pong_event() { }
+
+    bool allow_remote_web_auth_;
 
 public:
     static const int result_handle_packet_cancelled = -2;

@@ -1402,6 +1402,7 @@ int probe_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition
 
     /* get the mac address; this should be standard for anything */
     if (ifconfig_get_hwaddr(interface, errstr, hwaddr) < 0) {
+        snprintf(msg, STATUS_MAX, "Expected an interface with a standard network API, skipping");
         free(interface);
         return 0;
     }

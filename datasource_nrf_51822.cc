@@ -20,7 +20,7 @@
 
 #include "endian_magic.h"
 
-int kis_datasource_nrf51822::handle_rx_data_content(kis_packet *packet,
+kis_datasource_nrf51822::rx_content kis_datasource_nrf51822::handle_rx_data_content(kis_packet *packet,
         kis_datachunk *datachunk, const uint8_t *content, size_t content_sz) {
 
     typedef struct {
@@ -48,7 +48,7 @@ int kis_datasource_nrf51822::handle_rx_data_content(kis_packet *packet,
         // error, but preserve the packet for logging
         packet->set_data((const char *) content, content_sz);
         datachunk->set_data(packet->data);
-        return 1;
+        return rx_content::frame;
     }
 
     // apparently we can get multiple packets in one read; this should be addressed
@@ -136,19 +136,26 @@ int kis_datasource_nrf51822::handle_rx_data_content(kis_packet *packet,
 
         // Generate a l1 radio header and a decap header since we have it
         // computed already
-        auto radioheader = packetchain->new_packet_component<kis_layer1_packinfo>();
-        radioheader->signal_type = kis_l1_signal_type_dbm;
-        radioheader->signal_dbm = conv_header->signal;
-        radioheader->freq_khz = (2400 + (channel)) * 1000;
-        radioheader->channel = fmt::format("{}", (channel));
-        packet->insert(pack_comp_radiodata, radioheader);
+		packet->signal_info.data_ok = true;
+        packet->signal_info.signal_type = kis_l1_signal_type_dbm;
+        packet->signal_info.signal_dbm = conv_header->signal;
+        packet->signal_info.freq_khz = (2400 + (channel)) * 1000;
+        packet->signal_info.channel = fmt::format("{}", (channel));
 
         auto decapchunk = packetchain->new_packet_component<kis_datachunk>();
         decapchunk->dlt = KDLT_BLUETOOTH_LE_LL;
         decapchunk->set_data(packet->data.substr(sizeof(btle_rf), pkt_ctr));
         packet->insert(pack_comp_decap, decapchunk);
+    } else {
+        packet->crc_ok = true;
+        packet->checksum_valid = false;
+        packet->filtered = true;
+
+        // error, but preserve the packet for logging
+        packet->set_data((const char *) content, content_sz);
+        datachunk->set_data(packet->data);
     }
 
-    return 1;
+    return rx_content::frame;
 }
 

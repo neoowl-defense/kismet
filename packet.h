@@ -34,8 +34,10 @@
 #include <vector>
 #include <map>
 
+#include "base64.h"
 #include "eventbus.h"
 #include "globalregistry.h"
+#include "json_adapter_v2.h"
 #include "macaddr.h"
 #include "packet_ieee80211.h"
 #include "packetchain.h"
@@ -93,6 +95,8 @@ public:
     }
 
     void reset() {
+        common_info_ok = false;
+
         type = packet_basic_unknown;
         direction = packet_direction_unknown;
 
@@ -108,6 +112,9 @@ public:
         network = mac_addr(0);
         transmitter = mac_addr(0);
     }
+
+    // initialization indicator
+    bool common_info_ok;
 
     // Source - origin of packet
     // Destination - dest of packet
@@ -143,6 +150,8 @@ public:
     virtual bool unique() override { return true; }
 
     void set(std::shared_ptr<kis_gps_packinfo> src) {
+        gps_info_ok = src->gps_info_ok;
+
         merge_partial = src->merge_partial;
         merge_flags = src->merge_flags;
 
@@ -161,6 +170,8 @@ public:
     }
 
     void set(const kis_gps_packinfo& src) {
+        gps_info_ok = src.gps_info_ok;
+
         merge_partial = src.merge_partial;
         merge_flags = src.merge_flags;
 
@@ -178,6 +189,8 @@ public:
     }
 
     void reset() {
+        gps_info_ok = false;
+
         merge_partial = false;
         merge_flags = 0;
 
@@ -192,6 +205,26 @@ public:
 
         gps_id = 0;
     }
+
+    // A position reported by the device itself (ADS-B, AIS, Remote ID...),
+    // starting clean so nothing from an earlier fix is left over.  A fix of
+    // 0 means 3d if there's an altitude, else 2d.
+    void set_reported(double in_lat, double in_lon, double in_alt, double in_speed,
+            double in_heading, int in_fix, const struct timeval& in_tv) {
+        reset();
+        lat = in_lat;
+        lon = in_lon;
+        alt = in_alt;
+        speed = in_speed;
+        heading = in_heading;
+        fix = in_fix != 0 ? in_fix : (in_alt != 0 ? 3 : 2);
+        tv = in_tv;
+        // Altitude or speed with no position yet (adsb sends them separately)
+        // isn't a location
+        gps_info_ok = in_lat != 0 || in_lon != 0;
+    }
+
+    bool gps_info_ok;
 
     double lat;
     double lon;
@@ -221,6 +254,90 @@ public:
     struct timeval tv;
 };
 
+// Layer 1 radio info record for kismet
+enum kis_layer1_packinfo_signal_type {
+    kis_l1_signal_type_none,
+    kis_l1_signal_type_dbm,
+    kis_l1_signal_type_rssi
+};
+
+class kis_layer1_packinfo : public packet_component {
+public:
+    kis_layer1_packinfo() {
+        reset();
+    }
+
+    virtual bool unique() override { return true; }
+
+    void reset() {
+        data_ok = false;
+        signal_type = kis_l1_signal_type_none;
+        signal_dbm = noise_dbm = 0;
+        signal_rssi = noise_rssi = 0;
+        carrier = carrier_unknown;
+        encoding = encoding_unknown;
+        datarate = 0;
+        freq_khz = 0;
+        accuracy = 0;
+        channel = "0";
+        antenna_signal_map.clear();
+        content_checkum = 0;
+    }
+
+    bool data_ok;
+
+    // How "accurate" are we?  Higher == better.  Nothing uses this yet
+    // but we might as well track it here.
+    int accuracy;
+
+    // Frequency seen on
+    double freq_khz;
+
+    // Logical channel
+    std::string channel;
+
+    // Connection info
+    kis_layer1_packinfo_signal_type signal_type;
+    int signal_dbm, signal_rssi;
+    int noise_dbm, noise_rssi;
+
+    // Per-antenna info, mapped to the antenna number
+    std::map<uint8_t, int> antenna_signal_map;
+
+    // What carrier brought us this packet?
+    phy_carrier_type carrier;
+
+    // What encoding?
+    phy_encoding_type encoding;
+
+    // What data rate?
+    double datarate;
+
+    // Checksum, if checksumming is enabled; Only of the non-header
+    // data
+    uint32_t content_checkum;
+};
+
+// Combined list of signal levels collected over time for tracking signal levels of the
+// same transmission over multiple datasources, collected by the content deduper phase
+class kis_layer1_aggregate_packinfo : public packet_component {
+public:
+    kis_layer1_aggregate_packinfo() {
+        reset();
+    }
+
+    // We're not unique - multiple packets can insert l1 signals into the same
+    // aggregated list
+    virtual bool unique() override { return false; }
+
+    void reset() {
+        source_l1_map.clear();
+    }
+
+    std::unordered_map<uuid, std::shared_ptr<kis_layer1_packinfo>> source_l1_map;
+};
+
+
 // Overall packet container that holds packet information
 class kis_packet {
 public:
@@ -234,6 +351,9 @@ public:
 
     // Unique number of this packet
     uint64_t packet_no;
+
+    // Order the packet was queued for processing; bounds the dedupe lookback
+    uint64_t arrival_no;
 
     // Do we know this is in error from the capture source itself?
     int error;
@@ -255,6 +375,10 @@ public:
     // What hash has been calculated, if any?
     uint32_t hash;
 
+    // The frame the hash covers, as it was before the chain ran.  Later stages can shorten
+    // the frame components (hidedata); this stays a view into the packet's own data.
+    std::string_view hash_frame;
+
     // if packet is based on raw data, this contains the data backing and data is a
     // view into it that other components should slice
     std::string raw_data;
@@ -269,13 +393,23 @@ public:
     // Original length of capture, if truncated
     uint64_t original_len;
 
-    // Commonly needed info
-    bool common_info_ok;
+    // Some former dynamic packet components are now embedded in the packet itself;
+    // they're highly transient so making them ALL dynamically allocated isn't
+    // a great idea
+
+    // Common multiphy info
     kis_common_info common_info;
 
-    // gps info
-    bool gps_info_ok;
+    // Signal info
+    kis_layer1_packinfo signal_info;
+
+    // gps info: where kismet was when the packet was seen
+    bool suppress_gps;
     kis_gps_packinfo gps_info;
+
+    // Where the device itself says it is, for devices that report their own
+    // position; phys fill this, never gps_info
+    kis_gps_packinfo reported_gps;
 
     // Did this packet trigger creation of a new device?  Since a 
     // single packet can create multiple devices in some phys, maintain
@@ -634,84 +768,6 @@ public:
 
 };
 
-// Layer 1 radio info record for kismet
-enum kis_layer1_packinfo_signal_type {
-    kis_l1_signal_type_none,
-    kis_l1_signal_type_dbm,
-    kis_l1_signal_type_rssi
-};
-
-class kis_layer1_packinfo : public packet_component {
-public:
-    kis_layer1_packinfo() {
-        reset();
-    }
-
-    virtual bool unique() override { return true; }
-
-    void reset() {
-        signal_type = kis_l1_signal_type_none;
-        signal_dbm = noise_dbm = 0;
-        signal_rssi = noise_rssi = 0;
-        carrier = carrier_unknown;
-        encoding = encoding_unknown;
-        datarate = 0;
-        freq_khz = 0;
-        accuracy = 0;
-        channel = "0";
-    }
-
-    // How "accurate" are we?  Higher == better.  Nothing uses this yet
-    // but we might as well track it here.
-    int accuracy;
-
-    // Frequency seen on
-    double freq_khz;
-
-    // Logical channel
-    std::string channel;
-
-    // Connection info
-    kis_layer1_packinfo_signal_type signal_type;
-    int signal_dbm, signal_rssi;
-    int noise_dbm, noise_rssi;
-
-    // Per-antenna info, mapped to the antenna number
-    std::map<uint8_t, int> antenna_signal_map;
-
-    // What carrier brought us this packet?
-    phy_carrier_type carrier;
-
-    // What encoding?
-    phy_encoding_type encoding;
-
-    // What data rate?
-    double datarate;
-
-    // Checksum, if checksumming is enabled; Only of the non-header 
-    // data
-    uint32_t content_checkum;
-};
-
-// Combined list of signal levels collected over time for tracking signal levels of the
-// same transmission over multiple datasources, collected by the content deduper phase
-class kis_layer1_aggregate_packinfo : public packet_component {
-public:
-    kis_layer1_aggregate_packinfo() {
-        reset();
-    }
-
-    // We're not unique - multiple packets can insert l1 signals into the same
-    // aggregated list
-    virtual bool unique() override { return false; }
-
-    void reset() {
-        source_l1_map.clear();
-    }
-
-    std::unordered_map<uuid, std::shared_ptr<kis_layer1_packinfo>> source_l1_map;
-};
-
 // JSON as a raw string; parsing happens in the DS code; currently supports one JSON report
 // per packet, which is fine for the current design
 class kis_json_packinfo : public packet_component {
@@ -752,6 +808,144 @@ public:
     }
 
     std::map<std::string, std::string> tagmap;
+};
+
+class kis_tracked_packet_v2 : public json_adapter_v2::jsonable {
+public:
+    kis_tracked_packet_v2() :
+        json_adapter_v2::jsonable() {
+        reset();
+    }
+
+    kis_tracked_packet_v2(const kis_tracked_packet_v2& p) {
+        ts_sec_ = p.ts_sec_;
+        ts_usec_ = p.ts_usec_;
+        dlt_ = p.dlt_;
+        source_id_ = p.source_id_;
+        data_ = p.data_;
+    }
+
+    kis_tracked_packet_v2(const kis_tracked_packet_v2&& p) {
+        ts_sec_ = p.ts_sec_;
+        ts_usec_ = p.ts_usec_;
+        dlt_ = p.dlt_;
+        source_id_ = p.source_id_;
+        data_ = p.data_;
+    }
+
+    kis_tracked_packet_v2& operator =(const kis_tracked_packet_v2& p) {
+        ts_sec_ = p.ts_sec_;
+        ts_usec_ = p.ts_usec_;
+        dlt_ = p.dlt_;
+        source_id_ = p.source_id_;
+        data_ = p.data_;
+        return *this;
+    }
+
+    void reset() {
+        ts_sec_ = 0;
+        ts_usec_ = 0;
+        dlt_ = 0;
+        source_id_ = 0;
+        data_ = {};
+    }
+
+    auto ts_sec() { return ts_sec_; }
+    void set_ts_sec(uint64_t time) { ts_sec_ = time; }
+
+    auto ts_usec() { return ts_usec_; }
+    void set_ts_usec(uint64_t time) { ts_usec_ = time; }
+
+    const auto time() { return std::make_pair(ts_sec_, ts_usec_); }
+    void set_time(uint64_t ts, uint64_t us) {
+        ts_sec_ = ts;
+        ts_usec_ = us;
+    }
+
+    auto dlt() { return dlt_; }
+    void set_dlt(uint64_t dlt) { dlt_ = dlt; }
+
+    auto source_id() { return source_id_; }
+    void set_source_id(uint64_t id) { source_id_ = id; }
+
+    const auto& data() { return data_; }
+    void set_data(const std::string_view& data) { data_ = base64::encode(data); }
+
+    virtual void as_json(std::ostream& os, json_adapter_v2::opts *opts) {
+        fmt::print(os, "{{");
+
+        auto sv_comma = opts->next_key_comma;
+        opts->next_key_comma = false;
+
+        json_adapter_v2::json_encode_keyed<uint64_t>{}(os, "kismet.packet.ts_sec", opts, ts_sec());
+        json_adapter_v2::json_encode_keyed<uint64_t>{}(os, "kismet.packet.ts_usec", opts, ts_usec());
+        json_adapter_v2::json_encode_keyed<uint64_t>{}(os, "kismet.packet.dlt", opts, dlt());
+        json_adapter_v2::json_encode_keyed<uint64_t>{}(os, "kismet.packet.source", opts, source_id());
+        json_adapter_v2::json_encode_keyed<std::string>{}(os, "kismet.packet.data", opts, data());
+
+        opts->next_key_comma = sv_comma;
+    }
+
+    virtual void filtered_as_json(std::ostream& os, json_adapter_v2::opts *opts, const json_adapter_v2::field_group_map& fields) {
+        if (fields.size() == 0) {
+            return as_json(os, opts);
+        }
+
+        auto sv_comma = opts->next_key_comma;
+        opts->next_key_comma = false;
+
+        fmt::print(os, "{{");
+        for (const auto& f : fields) {
+            switch (json_adapter_v2::consthash(f.first)) {
+                case json_adapter_v2::consthash("kismet.packet.ts_sec"):
+                    json_adapter_v2::json_encode_keyed<uint64_t>{}(os, f.second.rename, opts, ts_sec());
+                    break;
+                case json_adapter_v2::consthash("kismet.packet.ts_usec"):
+                    json_adapter_v2::json_encode_keyed<uint64_t>{}(os, f.second.rename, opts, ts_usec());
+                    break;
+                case json_adapter_v2::consthash("kismet.packet.dlt"):
+                    json_adapter_v2::json_encode_keyed<uint64_t>{}(os, f.second.rename, opts, dlt());
+                    break;
+                case json_adapter_v2::consthash("kismet.packet.source"):
+                    json_adapter_v2::json_encode_keyed<uint64_t>{}(os, f.second.rename, opts, source_id());
+                    break;
+                case json_adapter_v2::consthash("kismet.packet.data"):
+                    json_adapter_v2::json_encode_keyed<std::string>{}(os, f.second.rename, opts, data());
+                    break;
+                default:
+                    json_adapter_v2::json_encode_keyed<int>{}(os, f.second.rename, opts, 0);
+            }
+        }
+
+        opts->next_key_comma = sv_comma;
+    }
+
+protected:
+    uint64_t ts_sec_;
+    uint64_t ts_usec_;
+    uint64_t dlt_;
+    uint64_t source_id_;
+    std::string data_;
+};
+
+template<> struct json_adapter_v2::json_encode<kis_tracked_packet_v2> {
+    void operator()(std::ostream& os, json_adapter_v2::opts *opts, kis_tracked_packet_v2& e) {
+        e.as_json(os, opts);
+    }
+
+    void operator()(std::ostream& os, json_adapter_v2::opts *opts, kis_tracked_packet_v2 *e) {
+        e->as_json(os, opts);
+    }
+
+    void operator()(std::ostream& os, json_adapter_v2::opts *opts, kis_tracked_packet_v2& e,
+            json_adapter_v2::field_group_map& fields) {
+        e.filtered_as_json(os, opts, fields);
+    }
+
+    void operator()(std::ostream& os, json_adapter_v2::opts *opts, kis_tracked_packet_v2 *e,
+            json_adapter_v2::field_group_map& fields) {
+        e->filtered_as_json(os, opts, fields);
+    }
 };
 
 #endif

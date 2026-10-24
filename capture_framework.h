@@ -39,6 +39,7 @@
 
 #include <getopt.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <fcntl.h>
 
 /* According to POSIX.1-2001, POSIX.1-2008 */
@@ -280,6 +281,9 @@ struct kis_capture_handler {
     /* Use legacy tcp mode */
     int use_tcp;
 
+    /* Set once a valid frame arrives from the server */
+    int remote_rx_valid;
+
     /* Use IPC mode */
     int use_ipc;
 
@@ -313,6 +317,9 @@ struct kis_capture_handler {
     struct lws_context_creation_info lwsinfo;
 
     char *lwsuuid;
+
+    /* Numeric address of the remote host which answered */
+    char lwsaddress[64];
 #endif
 
 
@@ -333,7 +340,7 @@ struct kis_capture_handler {
     int tcp_fd;
 
     /* Die when we hit the end of our write buffer */
-    int spindown;
+    atomic_int spindown;
 
     /* TCP/IPC buffers */
     kis_simple_ringbuf_t *in_ringbuf;
@@ -354,7 +361,7 @@ struct kis_capture_handler {
     pthread_mutex_t out_ringbuf_flush_cond_mutex;
 
     /* Are we shutting down? */
-    int shutdown;
+    atomic_int shutdown;
     pthread_mutex_t handler_lock;
 
     /* Callbacks called for various incoming packets */
@@ -800,10 +807,10 @@ void cf_cancel_packet(kis_capture_handler_t *caph,
 /* Commit a frame, this queues the frame for transmission and
  * unlocks the capture framework.
  *
- * The final length of the content is updated in the protoco frame
+ * The final length of the content is updated in the protocol frame
  * before transmission.
  *
- * At the end of queing, the meta data is freed and is no longer
+ * At the end of queueing, the meta data is freed and is no longer
  * valid for use.
  *
  * Returns:
@@ -1043,6 +1050,16 @@ void cf_set_verbose(kis_capture_handler_t *caph, int verbosity);
 
 uint32_t adler32_append_csum(uint8_t *in_buf, size_t in_len, uint32_t cs);
 uint32_t adler32_csum(uint8_t *in_buf, size_t in_len);
+
+/* The system firmware directories, in the order the Linux kernel's firmware loader searches
+ * them: the firmware_class.path parameter, /lib/firmware/updates/<release>,
+ * /lib/firmware/updates, /lib/firmware/<release>, then /lib/firmware.  Files are laid out
+ * as in linux-firmware (https://gitlab.com/kernel-firmware/linux-firmware), by the name
+ * drivers request, such as mediatek/WIFI_RAM_CODE_MT7961_1.bin.  Returns the number of
+ * directories filled in; none on other platforms. */
+#define CF_FIRMWARE_PATH_LEN    256
+#define CF_FIRMWARE_MAX_DIRS    5
+size_t cf_system_firmware_dirs(char dirs[CF_FIRMWARE_MAX_DIRS][CF_FIRMWARE_PATH_LEN]);
 
 /* Wait for an announcement from a Kismet server, populate the connection info */
 int cf_wait_announcement(kis_capture_handler_t *caph);

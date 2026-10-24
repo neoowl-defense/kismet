@@ -39,6 +39,7 @@
 
 #include <atomic>
 #include <memory>
+#include <shared_mutex>
 #include <string>
 
 #include "globalregistry.h"
@@ -56,7 +57,7 @@
 
 // Kismetdb version
 
-#define KISMETDB_LOG_VERSION            10
+#define KISMETDB_LOG_VERSION            11
 
 // This is a bit of a unique case - because so many things plug into this, it has
 // to exist as a global record; we build it like we do any other global record;
@@ -109,12 +110,14 @@ public:
 
     // Log data that isn't a packet; this is a slightly more clunky API because we
     // can't derive the data from the simple packet interface.  GPS may be null,
-    // and other attributes may be empty, if that data is not available
+    // and other attributes may be empty, if that data is not available.  gps is
+    // where kismet was; reported_gps, if any, is where the device said it was.
     virtual int log_data(const kis_gps_packinfo *gps,
             const kis_layer1_packinfo *l1info,
             const struct timeval& tv,
             const std::string& phystring, const mac_addr& devmac, const uuid& datasource_uuid,
-            const std::string& type, const std::string& json);
+            const std::string& type, const std::string& json,
+            const kis_gps_packinfo *reported_gps = nullptr);
 
     // Log datasources
     virtual int log_datasources(const shared_tracker_element& in_datasource_vec);
@@ -148,12 +151,46 @@ protected:
     // Is the database even enabled?
     std::atomic<bool> db_enabled;
 
+    // Held shared by everything that uses db while it uses it; close_log() takes it
+    // exclusively to wait for those still in flight before closing the database.  Writers
+    // still run in parallel with each other.
+    std::shared_mutex db_lifetime_mutex;
+
+    // close_log() called from inside a writer (an error path) can't wait for itself; the
+    // writer's guard finishes the close once it has released the lock
+    std::atomic<bool> close_pending;
+
+    // The log whose lifetime lock this thread holds, if any
+    static thread_local kis_database_logfile *current_writer;
+
+    class db_writer_guard {
+    public:
+        db_writer_guard(kis_database_logfile *in_log) :
+            log{in_log},
+            lk{in_log->db_lifetime_mutex},
+            prev_writer{current_writer} {
+            current_writer = log;
+        }
+
+        ~db_writer_guard() {
+            current_writer = prev_writer;
+            lk.unlock();
+
+            if (current_writer != log && log->close_pending.exchange(false))
+                log->close_log();
+        }
+
+    private:
+        kis_database_logfile *log;
+        std::shared_lock<std::shared_mutex> lk;
+        kis_database_logfile *prev_writer;
+    };
+
     std::shared_ptr<device_tracker> devicetracker;
     std::shared_ptr<gps_tracker> gpstracker;
 
-    int pack_comp_linkframe, pack_comp_gps, pack_comp_no_gps, pack_comp_radiodata,
-        pack_comp_device, pack_comp_datasource, pack_comp_metablob,
-        pack_comp_json;
+    int pack_comp_linkframe, pack_comp_device, pack_comp_datasource,
+        pack_comp_metablob, pack_comp_json;
 
     std::atomic<time_t> last_device_log;
 
@@ -180,7 +217,7 @@ protected:
     int packet_handler_id;
 
     // Keep track of our commit cycles; to avoid thrashing the filesystem with
-    // commit state we run a 10 second tranasction commit loop
+    // commit state we run a 10 second transaction commit loop
     kis_mutex transaction_mutex;
     int transaction_timer;
 
@@ -210,6 +247,7 @@ protected:
     // POI API
     void make_poi_endp_handler(std::shared_ptr<kis_net_beast_httpd_connection> con);
     std::shared_ptr<tracker_element> list_poi_endp_handler(std::shared_ptr<kis_net_beast_httpd_connection> con);
+    int poi_entry_id, poi_ts_sec_id, poi_ts_usec_id, poi_lat_id, poi_lon_id, poi_note_id;
 
     // Pcap streaming api
     void pcapng_endp_handler(std::shared_ptr<kis_net_beast_httpd_connection> con);

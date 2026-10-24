@@ -76,6 +76,49 @@ void uav_manuf_match::set_uav_manuf_ssid_regex(const std::string& in_regexstr) {
     uav_manuf_ssid_regex->set(in_regexstr);
 }
 
+void uav_tracked_remoteid::add_auth_page(const odid::auth_msg& a) {
+    if (a.page >= odid::max_auth_pages)
+        return;
+
+    if (a.page == 0) {
+        if (a.last_page >= odid::max_auth_pages)
+            return;
+
+        // A new signature starts over
+        if (!(auth_page_mask & 1) || a.timestamp != auth_page_ts || a.last_page != auth_last_page)
+            auth_page_mask = 0;
+
+        auth_page_ts = a.timestamp;
+        auth_last_page = a.last_page;
+        auth_length = a.length;
+        auth_pending_type = a.auth_type;
+    }
+
+    auth_pages[a.page] = a.data;
+    auth_page_mask |= 1u << a.page;
+
+    // Page 0 gives the page count
+    if (!(auth_page_mask & 1))
+        return;
+
+    uint32_t need = (1u << (auth_last_page + 1)) - 1;
+    if ((auth_page_mask & need) != need)
+        return;
+
+    std::string data;
+    for (unsigned int p = 0; p <= auth_last_page; p++)
+        data += auth_pages[p];
+
+    if (auth_length < data.length())
+        data.resize(auth_length);
+
+    set_auth_type(auth_pending_type);
+    set_auth_timestamp(auth_page_ts == 0 ? 0 : (uint64_t) auth_page_ts + odid::epoch_offset);
+    set_auth_data(uint8_to_hex_str((uint8_t *) data.data(), data.length()));
+
+    auth_page_mask = 0;
+}
+
 bool uav_manuf_match::match_record(const mac_addr& in_mac, const std::string& in_ssid) {
     if (get_uav_manuf_mac().longmac != 0) {
         if (get_uav_manuf_mac() == in_mac) {
@@ -123,8 +166,8 @@ kis_uav_phy::kis_uav_phy(int in_phyid) :
         packetchain->register_packet_component("JSON");
     pack_comp_meta =
         packetchain->register_packet_component("METABLOB");
-	pack_comp_gps =
-        packetchain->register_packet_component("GPS");
+    pack_comp_remoteid =
+        packetchain->register_packet_component("UAVREMOTEID");
 
     uav_device_id =
         Globalreg::globalreg->entrytracker->register_field("uav.device",
@@ -188,9 +231,24 @@ int kis_uav_phy::common_classifier(CHAINCALL_PARMS) {
     auto dot11info = in_pack->fetch<dot11_packinfo>(uavphy->pack_comp_80211);
 	auto devinfo = in_pack->fetch<kis_tracked_device_info>(uavphy->pack_comp_device);
     auto json = in_pack->fetch<kis_json_packinfo>(uavphy->pack_comp_json);
+    auto remoteid = in_pack->fetch<uav_remoteid_packinfo>(uavphy->pack_comp_remoteid);
 
     if (in_pack->error || in_pack->filtered || in_pack->duplicate) {
         return 0;
+    }
+
+    // Remote ID from any transport attaches to the device which sent it
+    if (remoteid != nullptr && devinfo != nullptr && !remoteid->messages.empty()) {
+        for (const auto& di : devinfo->devrefs) {
+            auto basedev = di.second;
+
+            if (basedev == nullptr || basedev->get_macaddr() != remoteid->device_mac)
+                continue;
+
+            kis_device_lock dlk(basedev, false);
+            uavphy->handle_remoteid(basedev, remoteid, in_pack);
+            break;
+        }
     }
 
     // Handle JSON packets from droneid rf
@@ -230,7 +288,7 @@ int kis_uav_phy::common_classifier(CHAINCALL_PARMS) {
 
             auto dronemac = mac_addr(bytes, 6);
 
-            in_pack->common_info_ok = true;
+            in_pack->common_info.common_info_ok = true;
             in_pack->common_info.type = packet_basic_data;
             in_pack->common_info.phyid = uavphy->fetch_phy_id();
             in_pack->common_info.datasize = 0;
@@ -240,42 +298,29 @@ int kis_uav_phy::common_classifier(CHAINCALL_PARMS) {
             in_pack->common_info.source = dronemac;
             in_pack->common_info.transmitter = dronemac;
 
+            // The device location is where kismet was when it heard the drone
             auto flags =
                 (UCD_UPDATE_FREQUENCIES | UCD_UPDATE_PACKETS |
-                 UCD_UPDATE_SEENBY);
+                 UCD_UPDATE_SEENBY | UCD_UPDATE_LOCATION);
 
+            // The drone's own position is its reported location
             if (drone_lat != 0 && drone_lon != 0) {
-                // We have to make a new component here, not fetch the existing one; otherwise we
-                // clobber the global gps record!
-                auto gpsinfo = uavphy->packetchain->new_packet_component<kis_gps_packinfo>();
-                gpsinfo->lat = drone_lat;
-                gpsinfo->lon = drone_lon;
-
-                // Absolute altitude of drone, not height from takeoff
-                gpsinfo->alt = drone_alt;
-              
                 // velocity vector to radians to degrees
-                auto heading_r = std::atan2(speed_e, speed_n);
-                gpsinfo->heading = heading_r * (180.0f / M_PI);
-                if (gpsinfo->heading < 0) {
-                    gpsinfo->heading += 360;
-                }
+                double heading = std::atan2(speed_e, speed_n) * (180.0f / M_PI);
+                if (heading < 0)
+                    heading += 360;
 
                 // speed is the magnitude of the ENU velocity vector,
                 // because we generally don't track the vertical speed
                 // in other situations (adsb, wifi) we only take the EN
                 // vector for 2d speed over ground here
-                gpsinfo->speed =
-                    std::sqrt((speed_e * speed_e) + (speed_n * speed_n));
+                double speed = std::sqrt((speed_e * speed_e) + (speed_n * speed_n));
 
-                if (drone_alt != 0)
-                    gpsinfo->fix = 3;
+                // Absolute altitude of drone, not height from takeoff
+                in_pack->reported_gps.set_reported(drone_lat, drone_lon, drone_alt,
+                        speed, heading, 0, in_pack->ts);
 
-                gpsinfo->tv = in_pack->ts;
-
-                in_pack->insert(uavphy->pack_comp_gps, gpsinfo);
-
-                flags |= UCD_UPDATE_LOCATION;
+                flags |= UCD_UPDATE_REPORTED_LOCATION;
             }
 
             auto basedev = 
@@ -286,7 +331,7 @@ int kis_uav_phy::common_classifier(CHAINCALL_PARMS) {
                 return 0;
             }
 
-            auto lg = kis_lock_guard<kis_mutex>(uavphy->devicetracker->get_devicelist_mutex(), "uav rf droneid");
+            kis_device_lock dlk(basedev, false);
 
             basedev->set_manuf(uavphy->dji_manuf);
             basedev->set_tracker_type_string(uavphy->devicetracker->get_cached_devicetype("DJI UAV"));
@@ -336,15 +381,13 @@ int kis_uav_phy::common_classifier(CHAINCALL_PARMS) {
     // that match the ssid/mac filters; drop a record along the dot11 device 
     // record
 
-    if (!in_pack->common_info_ok) {
+    if (!in_pack->common_info.common_info_ok) {
         return 1;
     }
 
     if (devinfo == nullptr || dot11info == nullptr) {
         return 1;
     }
-
-    kis_lock_guard<kis_mutex> lk(uavphy->devicetracker->get_devicelist_mutex(), "uav_phy common_classifier");
 
     for (auto di : devinfo->devrefs) {
         auto basedev = di.second;
@@ -355,6 +398,15 @@ int kis_uav_phy::common_classifier(CHAINCALL_PARMS) {
         // Only compare to the AP device for droneid and SSID matching
         if (basedev->get_macaddr() != dot11info->bssid_mac)
             continue;
+
+        // Nothing to record without drone ID data or a new SSID to match; most packets
+        // stop here without locking anything
+        if (dot11info->droneid == NULL &&
+                !(dot11info->new_adv_ssid && dot11info->type == packet_management &&
+                    (dot11info->subtype == packet_sub_beacon || dot11info->subtype == packet_sub_probe_resp)))
+            continue;
+
+        kis_device_lock dlk(basedev, false);
 
         if (dot11info->droneid != NULL) {
             try {
@@ -487,6 +539,246 @@ int kis_uav_phy::common_classifier(CHAINCALL_PARMS) {
     }
 
     return 1;
+}
+
+void kis_uav_phy::handle_remoteid(const std::shared_ptr<kis_tracked_device_base>& basedev,
+        const std::shared_ptr<uav_remoteid_packinfo>& rid, const std::shared_ptr<kis_packet>& in_pack) {
+    auto uavdev = basedev->get_sub_as<uav_tracked_device>(uav_device_id);
+
+    if (uavdev == nullptr) {
+        uavdev =
+            Globalreg::globalreg->entrytracker->get_shared_instance_as<uav_tracked_device>(uav_device_id);
+        basedev->insert(uavdev);
+    }
+
+    auto rec = uavdev->get_remoteid();
+    if (rec == nullptr)
+        return;
+
+    // Every packet, since the Wi-Fi phy re-types beaconing devices as access points
+    basedev->set_tracker_type_string(devicetracker->get_cached_devicetype("Drone / UAV"));
+
+    // Announce once the first UAS ID arrives; location messages often come first
+    auto uas_id = [&rec]() -> std::string {
+        for (const auto& id : { rec->get_only_serial_number(), rec->get_only_registration_id(),
+                rec->get_only_session_id(), rec->get_only_utm_id() })
+            if (id.length() != 0)
+                return id;
+        return "";
+    };
+
+    bool had_id = uas_id().length() != 0;
+
+    if (rid->transport != nullptr)
+        rec->set_transport(rid->transport);
+    rec->set_message_counter(rid->counter);
+
+    uavdev->set_uav_match_type("Remote ID");
+
+    for (const auto& m : rid->messages) {
+        rec->set_protocol_version(m.version);
+
+        switch (m.type) {
+            case odid::msg_type::basic_id: {
+                // A UA can send two basic IDs of different types, such as a serial and a
+                // session ID
+                auto id = munge_to_printable(m.basic_id.uas_id);
+
+                switch (static_cast<odid::id_type>(m.basic_id.id_type)) {
+                    case odid::id_type::serial:
+                        rec->set_serial_number(id);
+                        uavdev->set_uav_serialnumber(id);
+                        break;
+                    case odid::id_type::caa_registration:
+                        rec->set_registration_id(id);
+                        break;
+                    case odid::id_type::utm_uuid:
+                        rec->set_utm_id(id);
+                        break;
+                    case odid::id_type::session_id:
+                        rec->set_session_id(id);
+                        break;
+                    default:
+                        break;
+                }
+
+                rec->set_ua_type(m.basic_id.ua_type);
+
+                // UA type 0 is undeclared
+                if (uavdev->get_uav_model() == "" && m.basic_id.ua_type != 0)
+                    uavdev->set_uav_model(odid::ua_type_str(m.basic_id.ua_type));
+
+                break;
+            }
+
+            case odid::msg_type::location: {
+                const auto& l = m.location;
+
+                rec->set_status(l.status);
+                rec->set_height_type(l.height_type);
+                rec->set_horiz_accuracy(l.horiz_accuracy);
+                rec->set_vert_accuracy(l.vert_accuracy);
+                rec->set_baro_accuracy(l.baro_accuracy);
+                rec->set_speed_accuracy(l.speed_accuracy);
+                rec->set_timestamp_accuracy(l.ts_accuracy);
+
+                // Values the UA reports as unknown are removed, not left stale
+                if (l.direction_valid)
+                    rec->set_direction(l.direction);
+                else
+                    rec->clear_direction();
+
+                if (l.speed_valid)
+                    rec->set_speed_horizontal(l.speed_h);
+                else
+                    rec->clear_speed_horizontal();
+
+                if (l.speed_v_valid)
+                    rec->set_speed_vertical(l.speed_v);
+                else
+                    rec->clear_speed_vertical();
+
+                if (l.alt_baro_valid)
+                    rec->set_altitude_baro(l.alt_baro);
+                else
+                    rec->clear_altitude_baro();
+
+                if (l.alt_geo_valid)
+                    rec->set_altitude_geo(l.alt_geo);
+                else
+                    rec->clear_altitude_geo();
+
+                if (l.height_valid)
+                    rec->set_height(l.height);
+                else
+                    rec->clear_height();
+
+                if (l.timestamp_valid)
+                    rec->set_location_timestamp(l.timestamp);
+                else
+                    rec->clear_location_timestamp();
+
+                // Telemetry history only holds real positions
+                if (!l.latlon_valid)
+                    break;
+
+                auto telem = uavdev->new_telemetry();
+                auto loc = telem->get_location();
+
+                if (l.alt_geo_valid)
+                    loc->set(l.lat, l.lon, l.alt_geo, 3);
+                else
+                    loc->set(l.lat, l.lon);
+
+                // Packet time, not wall clock, so replayed captures keep their timeline
+                loc->set_time_sec(in_pack->ts.tv_sec);
+                loc->set_time_usec(in_pack->ts.tv_usec);
+
+                if (l.height_valid)
+                    telem->set_height(l.height);
+
+                if (l.speed_valid && l.direction_valid) {
+                    auto dir_r = l.direction * (M_PI / 180.0);
+                    telem->set_v_north(l.speed_h * std::cos(dir_r));
+                    telem->set_v_east(l.speed_h * std::sin(dir_r));
+                }
+
+                if (l.speed_v_valid)
+                    telem->set_v_up(l.speed_v);
+
+                // Airborne or emergency
+                telem->set_airborne(l.status == 2 || l.status == 3);
+                telem->set_telem_timestamp(ts_to_double(in_pack->ts));
+
+                uavdev->get_last_telem_loc()->set(telem);
+
+                // The drone's position is also its reported location (speed
+                // in km/h, like every gps record); the caller holds the device lock
+                in_pack->reported_gps.set_reported(l.lat, l.lon, l.alt_geo_valid ? l.alt_geo : 0,
+                        l.speed_valid ? l.speed_h * 3.6 : 0, l.direction_valid ? l.direction : 0,
+                        l.alt_geo_valid ? 3 : 2, in_pack->ts);
+                devicetracker->update_location_set(basedev->get_reported_location(), in_pack->reported_gps,
+                        in_pack, [&basedev]() { return basedev->get_reported_location_cloud(); });
+
+                auto tvec = uavdev->get_uav_telem_history();
+                tvec->push_back(telem);
+
+                if (tvec->size() > 128)
+                    tvec->erase(tvec->begin());
+
+                break;
+            }
+
+            case odid::msg_type::auth:
+                rec->add_auth_page(m.auth);
+                break;
+
+            case odid::msg_type::self_id:
+                rec->set_self_id_type(m.self_id.desc_type);
+                rec->set_self_id(munge_to_printable(m.self_id.desc));
+                break;
+
+            case odid::msg_type::system: {
+                const auto& sys = m.system;
+
+                rec->set_operator_location_type(sys.operator_location_type);
+                rec->set_classification_type(sys.classification_type);
+                rec->set_eu_category(sys.eu_category);
+                rec->set_eu_class(sys.eu_class);
+                rec->set_area_count(sys.area_count);
+                rec->set_area_radius(sys.area_radius);
+
+                if (sys.area_ceiling_valid)
+                    rec->set_area_ceiling(sys.area_ceiling);
+                else
+                    rec->clear_area_ceiling();
+
+                if (sys.area_floor_valid)
+                    rec->set_area_floor(sys.area_floor);
+                else
+                    rec->clear_area_floor();
+
+                if (sys.operator_alt_valid)
+                    rec->set_operator_altitude(sys.operator_alt_geo);
+                else
+                    rec->clear_operator_altitude();
+                if (sys.timestamp != 0)
+                    rec->set_system_timestamp(sys.timestamp);
+
+                if (sys.operator_latlon_valid) {
+                    auto set_loc = [&](const std::shared_ptr<kis_tracked_location_triplet>& loc) {
+                        if (sys.operator_alt_valid)
+                            loc->set(sys.operator_lat, sys.operator_lon, sys.operator_alt_geo, 3);
+                        else
+                            loc->set(sys.operator_lat, sys.operator_lon);
+
+                        loc->set_time_sec(in_pack->ts.tv_sec);
+                        loc->set_time_usec(in_pack->ts.tv_usec);
+                    };
+
+                    set_loc(uavdev->get_app_location());
+
+                    // Location type 0: the operator location is the takeoff location
+                    if (sys.operator_location_type == 0)
+                        set_loc(uavdev->get_home_location());
+                }
+
+                break;
+            }
+
+            case odid::msg_type::operator_id:
+                rec->set_operator_id_type(m.operator_id.id_type);
+                rec->set_operator_id(munge_to_printable(m.operator_id.operator_id));
+                break;
+
+            default:
+                break;
+        }
+    }
+
+    if (!had_id && uas_id().length() != 0)
+        _MSG_INFO("Detected new Remote ID UAV {} ({}) ID '{}'", basedev->get_macaddr(),
+                rid->transport != nullptr ? rid->transport : "unknown", uas_id());
 }
 
 bool kis_uav_phy::parse_manuf_definition(std::string in_def) {

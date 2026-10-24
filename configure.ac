@@ -38,6 +38,7 @@ BUILD_CAPTURE_TI_CC_2531=1
 BUILD_CAPTURE_UBERTOOTH_ONE=0
 BUILD_CAPTURE_SDR_RTL433V2=0
 BUILD_CAPTURE_SDR_RTLADSBV2=0
+BUILD_CAPTURE_SDR_RTLAIS=0
 BUILD_CATPURE_FREAKLABS_ZIGBEEV2=1
 BUILD_CAPTURE_NRF_51822=0
 BUILD_CAPTURE_NXP_KW41Z=0
@@ -45,10 +46,14 @@ BUILD_CAPTURE_RZ_KILLERBEE=0
 BUILD_CAPTURE_BLADERF_WLAN=0
 BUILD_CAPTURE_NRF_52840=0
 BUILD_CAPTURE_HAK5_COCONUT=0
+BUILD_CAPTURE_USBWIFI=0
+BUILD_CAPTURE_MM8108=0
 BUILD_CAPTURE_CATSNIFFER_ZIGBEE=1
 BUILD_CAPTURE_WCH_BLE_ANALYZER_PRO=1
 BUILD_CAPTURE_USB_RADIACODE=0
 BUILD_CAPTURE_ANTSDR_DRONEID=1
+BUILD_CAPTURE_SNIFFLE_BLE=1
+BUILD_CAPTURE_LORAPIPE=1
 
 # deprecated
 BUILD_CAPTURE_SDR_RTL433=0
@@ -56,7 +61,6 @@ BUILD_CAPTURE_SDR_RTLAMR=0
 BUILD_CAPTURE_SDR_RTLADSB=0
 BUILD_CAPTURE_BT_GEIGER=0
 BUILD_CAPTURE_FREAKLABS_ZIGBEE=0
-BUILD_CAPTURE_PROXY_ADSB=0
 
 DATASOURCE_BINS="\$(CAPTURE_KISMETDB)"
 
@@ -892,7 +896,7 @@ if test "$wantwext" = "yes"; then
 	fi # wexth
 
 	AC_MSG_RESULT(yes)
-	AC_DEFINE(HAVE_LINUX_WIRELESS, 1, Linux wireless extentions present)
+	AC_DEFINE(HAVE_LINUX_WIRELESS, 1, Linux wireless extensions present)
 	linux_wireless="yes";
 
 	if test "$linux_wireless" = "yes"; then
@@ -1053,7 +1057,7 @@ if test "$caponly"x = "no"x; then
     # AC_CHECK_LIB([tbb], [main], CXXLIBS="$CXXLIBS -ltbb")
 fi
 
-# Dont' check pcre if we're only building datasources
+# Don't check pcre if we're only building datasources
 if test "$caponly"x = "no"x; then
     if test "$wantpcre" = "yes"; then
         # Check for pcre2 first
@@ -1177,7 +1181,7 @@ AS_IF([test "x$want_libwebsockets" != "xno"], [
         AC_CHECK_LIB([websockets], [lws_client_connect_via_info],
                      [
                      LIBWSLIBS=`pkg-config --libs libwebsockets`
-                     LIBWSFLAGS=`pkg-config --cflags libwebsockets`
+                     LIBWSCFLAGS=`pkg-config --cflags libwebsockets`
 
                      have_libwebsockets="yes"
                      AC_DEFINE(HAVE_LIBWEBSOCKETS, 1, libwebsockets)
@@ -1641,6 +1645,111 @@ if test x"$want_coconut" = x"yes"; then
     DATASOURCE_BINS="$DATASOURCE_BINS \$(CAPTURE_HAK5_COCONUT)"
 fi
 
+# Compressed firmware for the userspace drivers; many distributions install linux-firmware
+# compressed with zstd or xz
+want_fwcompress="yes"
+AC_ARG_ENABLE([firmware-compression],
+    AS_HELP_STRING([--disable-firmware-compression], [Disable loading zstd and xz compressed firmware in the userspace USB drivers]),
+	[case "${enableval}" in
+          no) want_fwcompress=no ;;
+           *) want_fwcompress=yes ;;
+	 esac],
+         [want_fwcompress=yes]
+)
+
+FIRMWARELIBS=""
+FIRMWARECFLAGS=""
+fw_compression=""
+if test x"$want_fwcompress" = x"yes"; then
+    PKG_CHECK_MODULES([libzstd], [libzstd], [have_libzstd=yes], [have_libzstd=no])
+    if test x"$have_libzstd" = x"yes"; then
+        AC_DEFINE(HAVE_LIBZSTD, 1, [zstd compressed firmware support])
+        FIRMWARELIBS="$FIRMWARELIBS $libzstd_LIBS"
+        FIRMWARECFLAGS="$FIRMWARECFLAGS $libzstd_CFLAGS"
+        fw_compression="zstd"
+    else
+        AC_MSG_WARN([libzstd not found; zstd compressed (.zst) firmware will not be supported by the userspace USB drivers])
+    fi
+
+    PKG_CHECK_MODULES([liblzma], [liblzma], [have_liblzma=yes], [have_liblzma=no])
+    if test x"$have_liblzma" = x"yes"; then
+        AC_DEFINE(HAVE_LIBLZMA, 1, [xz compressed firmware support])
+        FIRMWARELIBS="$FIRMWARELIBS $liblzma_LIBS"
+        FIRMWARECFLAGS="$FIRMWARECFLAGS $liblzma_CFLAGS"
+        fw_compression="$fw_compression xz"
+    else
+        AC_MSG_WARN([liblzma not found; xz compressed (.xz) firmware will not be supported by the userspace USB drivers])
+    fi
+fi
+AC_SUBST(FIRMWARELIBS)
+AC_SUBST(FIRMWARECFLAGS)
+
+# Built by default on Linux and macOS when libusb is available
+want_usbwifi="auto"
+AC_ARG_ENABLE([usbwifi],
+    AS_HELP_STRING([--disable-usbwifi], [Disable userspace USB Wi-Fi (Linux drivers on libusb); built by default on Linux and macOS when libusb is available]),
+	[case "${enableval}" in
+          no) want_usbwifi=no ;;
+           *) want_usbwifi=yes ;;
+	 esac],
+         [want_usbwifi=auto]
+)
+
+BUILD_CAPTURE_USBWIFI=0
+usbwifi_reason="disabled"
+if test x"$want_usbwifi" = x"auto"; then
+    if test x"$linux" != x"yes" -a x"$darwin" != x"yes"; then
+        want_usbwifi=no
+        usbwifi_reason="only built by default on Linux and macOS, use --enable-usbwifi"
+    elif test x"$have_usb" != x"yes"; then
+        want_usbwifi=no
+        usbwifi_reason="libusb-1.0 not found"
+    else
+        want_usbwifi=yes
+    fi
+fi
+
+if test x"$want_usbwifi" = x"yes"; then
+    if test x"$have_usb" != "xyes"; then
+        AC_MSG_ERROR([libusb-1.0 required for userspace USB Wi-Fi support])
+    fi
+    BUILD_CAPTURE_USBWIFI=1
+    DATASOURCE_BINS="$DATASOURCE_BINS \$(CAPTURE_USBWIFI)"
+fi
+
+# Built by default on Linux and macOS when libusb is available
+want_mm8108="auto"
+AC_ARG_ENABLE([mm8108],
+    AS_HELP_STRING([--disable-mm8108], [Disable Morse Micro MM8108 USB HaLow (userspace via libusb); built by default on Linux and macOS when libusb is available]),
+	[case "${enableval}" in
+          no) want_mm8108=no ;;
+           *) want_mm8108=yes ;;
+	 esac],
+         [want_mm8108=auto]
+)
+
+BUILD_CAPTURE_MM8108=0
+mm8108_reason="disabled"
+if test x"$want_mm8108" = x"auto"; then
+    if test x"$linux" != x"yes" -a x"$darwin" != x"yes"; then
+        want_mm8108=no
+        mm8108_reason="only built by default on Linux and macOS, use --enable-mm8108"
+    elif test x"$have_usb" != x"yes"; then
+        want_mm8108=no
+        mm8108_reason="libusb-1.0 not found"
+    else
+        want_mm8108=yes
+    fi
+fi
+
+if test x"$want_mm8108" = x"yes"; then
+    if test x"$have_usb" != "xyes"; then
+        AC_MSG_ERROR([libusb-1.0 required for MM8108 HaLow support])
+    fi
+    BUILD_CAPTURE_MM8108=1
+    DATASOURCE_BINS="$DATASOURCE_BINS \$(CAPTURE_MM8108)"
+fi
+
 
 want_ubertooth="yes"
 AC_ARG_ENABLE([ubertooth],
@@ -1842,6 +1951,12 @@ if test "$have_usb" = "yes" -a "$have_rtlsdr" = "yes"; then
     DATASOURCE_BINS="$DATASOURCE_BINS \$(CAPTURE_SDR_RTLADSBV2)"
 fi
 
+BUILD_CAPTURE_SDR_RTLAIS=0
+if test "$have_usb" = "yes" -a "$have_rtlsdr" = "yes"; then
+    BUILD_CAPTURE_SDR_RTLAIS=1
+    DATASOURCE_BINS="$DATASOURCE_BINS \$(CAPTURE_SDR_RTLAIS)"
+fi
+
 BUILD_CAPTURE_LINUX_BLUETOOTH=0
 if test "$linux" = "yes"; then
     BUILD_CAPTURE_LINUX_BLUETOOTH=1
@@ -1864,6 +1979,12 @@ DATASOURCE_BINS="$DATASOURCE_BINS \$(CAPTURE_NRF_52840)"
 
 BUILD_CAPTURE_CATSNIFFER_ZIGBEE=1
 DATASOURCE_BINS="$DATASOURCE_BINS \$(CAPTURE_CATSNIFFER_ZIGBEE)"
+
+BUILD_CAPTURE_SNIFFLE_BLE=1
+DATASOURCE_BINS="$DATASOURCE_BINS \$(CAPTURE_SNIFFLE_BLE)"
+
+BUILD_CAPTURE_LORAPIPE=1
+DATASOURCE_BINS="$DATASOURCE_BINS \$(CAPTURE_LORAPIPE)"
 
 BUILD_CAPTURE_FREAKLABS_ZIGBEEV2=1
 DATASOURCE_BINS="$DATASOURCE_BINS \$(CAPTURE_FREAKLABS_ZIGBEEV2)"
@@ -2031,6 +2152,7 @@ AC_SUBST(BUILD_CAPTURE_SDR_RTLADSB)
 AC_SUBST(BUILD_CAPTURE_BT_GEIGER)
 AC_SUBST(BUILD_CAPTURE_SDR_RTL433V2)
 AC_SUBST(BUILD_CAPTURE_SDR_RTLADSBV2)
+AC_SUBST(BUILD_CAPTURE_SDR_RTLAIS)
 AC_SUBST(BUILD_CAPTURE_FREAKLABS_ZIGBEEV2)
 AC_SUBST(BUILD_CAPTURE_NRF_MOUSEJACK)
 AC_SUBST(BUILD_CAPTURE_TI_CC_2540)
@@ -2038,11 +2160,14 @@ AC_SUBST(BUILD_CAPTURE_TI_CC_2531)
 AC_SUBST(BUILD_CAPTURE_UBERTOOTH_ONE)
 AC_SUBST(BUILD_CAPTURE_NRF_51822)
 AC_SUBST(BUILD_CAPTURE_NXP_KW41Z)
-AC_SUBST(BUILD_CAPTURE_PROXY_ADSB)
 AC_SUBST(BUILD_CAPTURE_RZ_KILLERBEE)
 AC_SUBST(BUILD_CAPTURE_NRF_52840)
 AC_SUBST(BUILD_CAPTURE_CATSNIFFER_ZIGBEE)
+AC_SUBST(BUILD_CAPTURE_SNIFFLE_BLE)
+AC_SUBST(BUILD_CAPTURE_LORAPIPE)
 AC_SUBST(BUILD_CAPTURE_HAK5_COCONUT)
+AC_SUBST(BUILD_CAPTURE_USBWIFI)
+AC_SUBST(BUILD_CAPTURE_MM8108)
 AC_SUBST(BUILD_CAPTURE_SERIAL_RADVIEW)
 AC_SUBST(BUILD_CAPTURE_USB_RADIACODE)
 AC_SUBST(BUILD_CAPTURE_ANTSDR_DRONEID)
@@ -2058,29 +2183,34 @@ AC_CONFIG_FILES([
     packaging/kismet.pc
     packaging/systemd/kismet.service
     packaging/systemd/debug/kismet-debug.service
+    capture_antsdr_droneid/Makefile
+    capture_bladerf_wiphy/Makefile
+    capture_catsniffer_zigbee/Makefile
+    capture_freaklabs_zigbee_v2/Makefile
+    capture_hak5_wifi_coconut/Makefile
+    capture_userspace_usb_wifi/Makefile
+    capture_morse_mm8108_usb_halow/Makefile
     capture_linux_bluetooth/Makefile
     capture_linux_wifi/Makefile
+    capture_nrf_51822/Makefile
+    capture_nrf_52840/Makefile
+    capture_nrf_mousejack/Makefile
+    capture_nxp_kw41z/Makefile
     capture_openbsd_wifi/Makefile
     capture_osx_corewlan_wifi/Makefile
-    capture_nrf_mousejack/Makefile
+    capture_radiacode/Makefile
+    capture_rz_killerbee/Makefile
     capture_sdr_rtl433_v2/Makefile
     capture_sdr_rtladsb_v2/Makefile
-    capture_freaklabs_zigbee_v2/Makefile
+    capture_sdr_rtlais/Makefile
+    capture_sdr_zigbee900/Makefile
+    capture_serial_radview/Makefile
+    capture_sniffle_ble/Makefile
     capture_ti_cc_2540/Makefile
     capture_ti_cc_2531/Makefile
     capture_ubertooth_one/Makefile
-    capture_nrf_51822/Makefile
-    capture_nxp_kw41z/Makefile
-    capture_rz_killerbee/Makefile
-    capture_bladerf_wiphy/Makefile
-    capture_proxy_adsb/Makefile
-    capture_nrf_52840/Makefile
-    capture_catsniffer_zigbee/Makefile
-    capture_hak5_wifi_coconut/Makefile
-    capture_serial_radview/Makefile
-    capture_radiacode/Makefile
-    capture_antsdr_droneid/Makefile
     capture_wch_ble_analyzer_pro/Makefile
+    capture_lorapipe/Makefile
     ])
 AC_OUTPUT
 
@@ -2289,6 +2419,19 @@ else
     fi
 fi
 
+printf "           RTL-SDR AIS: "
+if test "$BUILD_CAPTURE_SDR_RTLAIS" = 1; then
+	echo "yes";
+else
+    if test "$have_usb" != "yes"; then
+	    echo "no (libusb not available)";
+    elif test "$have_rtlsdr" != "yes"; then
+        echo "no (librtlsdr not available)";
+    else
+        echo "no (not available)";
+    fi
+fi
+
 printf "        ANTSDR DroneID: "
 if test "$BUILD_CAPTURE_ANTSDR_DRONEID" = 1; then
 	echo "yes";
@@ -2308,6 +2451,12 @@ if test "$BUILD_CAPTURE_CATSNIFFER_ZIGBEE" = 1; then
 else
 	echo "no";
 fi
+printf "           Sniffle BLE: "
+if test "$BUILD_CAPTURE_SNIFFLE_BLE" = 1; then
+	echo "yes";
+else
+	echo "no";
+fi
 printf "  WCH BLE Analyzer Pro: "
 if test "$BUILD_CAPTURE_WCH_BLE_ANALYZER_PRO" = 1; then
 	echo "yes";
@@ -2319,6 +2468,36 @@ if test "$BUILD_CAPTURE_HAK5_COCONUT" = 1; then
 	echo "yes";
 else
 	echo "no (Hak5 WiFi Coconut not explicitly enabled)";
+fi
+printf "    USB Wi-Fi (uspace): "
+if test "$BUILD_CAPTURE_USBWIFI" = 1; then
+	echo "yes";
+else
+	echo "no ($usbwifi_reason)";
+fi
+printf "    MM8108 HaLow (USB): "
+if test "$BUILD_CAPTURE_MM8108" = 1; then
+	echo "yes";
+else
+	echo "no ($mm8108_reason)";
+fi
+printf "   Compressed firmware: "
+if test x"$want_fwcompress" != x"yes"; then
+	echo "no (disabled)";
+elif test x"$fw_compression" = x""; then
+	echo "no (libzstd and liblzma not found)";
+elif test x"$have_libzstd" != x"yes"; then
+	echo "xz only (libzstd not found)";
+elif test x"$have_liblzma" != x"yes"; then
+	echo "zstd only (liblzma not found)";
+else
+	echo "yes (zstd xz)";
+fi
+printf "              Lorapipe: "
+if test "$BUILD_CAPTURE_LORAPIPE" = 1; then
+	echo "yes";
+else
+	echo "no";
 fi
 
 printf " lm-sensors monitoring: "

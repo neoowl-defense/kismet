@@ -5,6 +5,8 @@ CONFIGFILES = \
 	kismet_httpd.conf \
 	kismet_alerts.conf \
 	kismet_memory.conf \
+	kismet_meshtastic.conf \
+	kismet_meshcore.conf \
 	kismet_logging.conf \
 	kismet_filter.conf \
 	kismet_uav.conf \
@@ -19,6 +21,7 @@ PARSERS = \
 	dot11_parsers/dot11_ie_33_power.cc.o \
 	dot11_parsers/dot11_ie_35_tpc.cc.o \
 	dot11_parsers/dot11_ie_36_supported_channels.cc.o \
+	dot11_parsers/dot11_ie_37_csa.cc.o \
 	dot11_parsers/dot11_ie_45_ht_cap.cc.o \
 	dot11_parsers/dot11_ie_48_rsn.cc.o \
 	dot11_parsers/dot11_ie_52_rmm_neighbor.cc.o \
@@ -45,13 +48,18 @@ PARSERS = \
 	dot11_parsers/dot11_ie_221_wpa_transition.cc.o \
 	dot11_parsers/dot11_ie_221_rsn_pmkid.cc.o \
 	dot11_parsers/dot11_ie_221_wfa.cc.o \
+	dot11_parsers/dot11_ie_221_ubnt_airmax_ac.cc.o \
+	dot11_parsers/dot11_ie_221_ubnt_airmax_m.cc.o \
+	dot11_parsers/dot11_ie_221_mikrotik.cc.o \
+	dot11_parsers/dot11_ubnt_airmax_crypto.cc.o \
 	dot11_parsers/dot11_ie_232_s1g_operation.cc.o \
 	dot11_parsers/dot11_ie_255_ext_tag.cc.o \
 	dot11_parsers/dot11_action.cc.o \
 	dot11_parsers/dot11_wpa_eap.cc.o \
 	dot11_parsers/dot11_p2p_ie.cc.o \
 	dot11_parsers/dot11_s1g.cc.o \
-	bluetooth_parsers/btle.cc.o
+	bluetooth_parsers/btle.cc.o \
+	uav_parsers/opendroneid.cc.o
 
 # To prevent a deps problem, we define these targets via autoconf to reference
 # the variable setting the list
@@ -74,7 +82,7 @@ PROTOBUF_CPP_H = \
 # Common pure-c code for capturesource binaries
 DATASOURCE_COMMON_C_O = \
     mpack/mpack.c.o \
-	simple_ringbuf_c.c.o version.c.o capture_framework.c.o
+	simple_ringbuf_c.c.o version.c.o capture_framework.c.o firmware_file.c.o
 DATASOURCE_COMMON_A = libkismetdatasource.a
 
 CAPTURE_PCAPFILE_O = \
@@ -122,6 +130,9 @@ BUILD_CAPTURE_SDR_RTL433V2 = @BUILD_CAPTURE_SDR_RTL433V2@
 CAPTURE_SDR_RTLADSBV2 = capture_sdr_rtladsb_v2/kismet_cap_sdr_rtladsb
 BUILD_CAPTURE_SDR_RTLADSBV2 = @BUILD_CAPTURE_SDR_RTLADSBV2@
 
+CAPTURE_SDR_RTLAIS = capture_sdr_rtlais/kismet_cap_sdr_rtlais
+BUILD_CAPTURE_SDR_RTLAIS = @BUILD_CAPTURE_SDR_RTLAIS@
+
 CAPTURE_FREAKLABS_ZIGBEEV2 = capture_freaklabs_zigbee_v2/kismet_cap_freaklabs_zigbee
 BUILD_CAPTURE_FREAKLABS_ZIGBEEV2 = @BUILD_CAPTURE_FREAKLABS_ZIGBEEV2@
 
@@ -155,6 +166,12 @@ BUILD_CAPTURE_BLADERF_WIPHY = @BUILD_CAPTURE_BLADERF_WLAN@
 CAPTURE_HAK5_COCONUT = capture_hak5_wifi_coconut/kismet_cap_hak5_wifi_coconut
 BUILD_CAPTURE_HAK5_COCONUT = @BUILD_CAPTURE_HAK5_COCONUT@
 
+CAPTURE_USBWIFI = capture_userspace_usb_wifi/kismet_cap_usbwifi
+BUILD_CAPTURE_USBWIFI = @BUILD_CAPTURE_USBWIFI@
+
+CAPTURE_MM8108 = capture_morse_mm8108_usb_halow/kismet_cap_mm8108_halow
+BUILD_CAPTURE_MM8108 = @BUILD_CAPTURE_MM8108@
+
 CAPTURE_SERIAL_RADVIEW = capture_serial_radview/kismet_cap_serial_radview
 BUILD_CAPTURE_SERIAL_RADVIEW = @BUILD_CAPTURE_SERIAL_RADVIEW@
 
@@ -166,6 +183,12 @@ BUILD_CAPTURE_ANTSDR_DRONEID = @BUILD_CAPTURE_ANTSDR_DRONEID@
 
 CAPTURE_CATSNIFFER_ZIGBEE = capture_catsniffer_zigbee/kismet_cap_catsniffer_zigbee
 BUILD_CAPTURE_CATSNIFFER_ZIGBEE = @BUILD_CAPTURE_CATSNIFFER_ZIGBEE@
+
+CAPTURE_SNIFFLE_BLE = capture_sniffle_ble/kismet_cap_sniffle_ble
+BUILD_CAPTURE_SNIFFLE_BLE = @BUILD_CAPTURE_SNIFFLE_BLE@
+
+CAPTURE_LORAPIPE = capture_lorapipe/kismet_cap_lorapipe
+BUILD_CAPTURE_LORAPIPE = @BUILD_CAPTURE_LORAPIPE@
 
 CAPTURE_WCH_BLE_ANALYZER_PRO = capture_wch_ble_analyzer_pro/kismet_cap_wch_ble_analyzer_pro
 BUILD_CAPTURE_WCH_BLE_ANALYZER_PRO = @BUILD_CAPTURE_WCH_BLE_ANALYZER_PRO@
@@ -230,7 +253,7 @@ TOOL_KISMET_DISCOVERY_O = \
 TOOL_BINS = \
 	$(TOOL_KISMET_DISCOVERY)
 
-PSO	= util.cc.o crc32.cc.o macaddr.cc.o uuid.cc.o xxhash.cc.o boost_like_hash.cc.o \
+PSO	= util.cc.o crc32.cc.o console_tui.cc.o macaddr.cc.o uuid.cc.o xxhash.cc.o boost_like_hash.cc.o \
 	sqlite3_cpp11.cc.o mpack/mpack.c.o \
 	globalregistry.cc.o eventbus.cc.o \
 	packet.cc.o configfile.cc.o \
@@ -238,33 +261,35 @@ PSO	= util.cc.o crc32.cc.o macaddr.cc.o uuid.cc.o xxhash.cc.o boost_like_hash.cc
 	ipctracker_v2.cc.o \
 	$(PROTOBUF_CPP_O_TARGET) kis_external.cc.o \
 	dlttracker.cc.o antennatracker.cc.o datasourcetracker.cc.o kis_datasource.cc.o \
-	datasource_linux_bluetooth.cc.o datasource_rtl433.cc.o datasource_rtlamr.cc.o datasource_rtladsb.cc.o \
+	datasource_linux_bluetooth.cc.o datasource_rtl433.cc.o datasource_rtlamr.cc.o datasource_rtladsb.cc.o datasource_rtlais.cc.o \
 	datasource_ti_cc_2540.cc.o datasource_ti_cc_2531.cc.o datasource_ubertooth_one.cc.o datasource_nrf_51822.cc.o \
 	datasource_nxp_kw41z.cc.o datasource_nrf_52840.cc.o datasource_rz_killerbee.cc.o datasource_scan.cc.o \
 	datasource_bt_geiger.cc.o datasource_mqtt.cc.o \
-	datasource_catsniffer_zigbee.cc.o \
+	datasource_catsniffer_zigbee.cc.o datasource_sniffle_ble.cc.o \
+	datasource_lorapipe.cc.o \
 	kis_net_beast_httpd.cc.o kis_httpd_registry.cc.o \
 	system_monitor.cc.o \
-	base64.cc.o \
-	gpstracker.cc.o kis_gps.cc.o gpsnmea_v2.cc.o gpsserial_v3.cc.o gpstcp_v2.cc.o \
+	gpstracker.cc.o kis_gps.cc.o gpsnmea_v3.cc.o gpsubx_v1.cc.o gpssirf_v1.cc.o gpsframer_v1.cc.o gpsserial_v3.cc.o gpstcp_v2.cc.o \
 	gpsgpsd_v3.cc.o gpsfake.cc.o gpsweb.cc.o gpsmeta.cc.o \
 	packetchain.cc.o packet_filter.cc.o class_filter.cc.o \
 	trackedelement.cc.o trackedelement_workers.cc.o trackedcomponent.cc.o entrytracker.cc.o \
 	trackedlocation.cc.o devicetracker_component.cc.o \
 	devicetracker_view.cc.o devicetracker_view_workers.cc.o \
-	json_adapter_v2.cc.o devicetracker_component_v2.cc.o \
+	devicetracker_view_workers_v2.cc.o \
+	json_adapter_v2.cc.o devicetracker_component_v2.cc.o trackedlocation_v2.cc.o \
 	channeltracker_v3.cc.o \
 	kis_server_announce.cc.o \
 	json_adapter.cc.o \
-	plugintracker.cc.o alertracker.cc.o timetracker.cc.o channeltracker2.cc.o \
+	plugintracker.cc.o alertracker.cc.o timetracker.cc.o \
 	devicetracker.cc.o devicetracker_httpd.cc.o \
 	kis_dlt.cc.o kis_dlt_ppi.cc.o kis_dlt_radiotap.cc.o kis_dlt_btle_radio.cc.o \
+	kis_dlt_loratap.cc.o \
 	kaitaistream.cc.o \
 	$(PARSERS) \
-	phy_80211.cc.o phy_80211_components.cc.o phy_80211_dissectors.cc.o \
-	phy_sensor.cc.o phy_meter.cc.o phy_adsb.cc.o phy_zwave.cc.o \
-	phy_bluetooth.cc.o phy_uav_drone.cc.o phy_nrf_mousejack.cc.o phy_btle.cc.o phy_802154.cc.o \
-	phy_80211_ssidtracker.cc.o phy_radiation.cc.o \
+	phy_80211.cc.o phy_80211_components.cc.o phy_80211_components_v2.cc.o phy_80211_dissectors.cc.o \
+	phy_sensor.cc.o phy_meter.cc.o phy_adsb.cc.o phy_ais.cc.o phy_zwave.cc.o \
+	phy_bluetooth.cc.o phy_uav_drone.cc.o phy_nrf_mousejack.cc.o phy_btle.cc.o phy_802154.cc.o phy_ant.cc.o \
+	phy_80211_ssidtracker.cc.o phy_radiation.cc.o phy_meshtastic.cc.o phy_meshcore.cc.o \
 	kis_dissector_ipdata.cc.o \
 	manuf.cc.o bluetooth_ids.cc.o adsb_icao.cc.o \
 	logtracker.cc.o kis_ppilogfile.cc.o kis_databaselogfile.cc.o kis_pcapnglogfile.cc.o \
@@ -391,6 +416,9 @@ $(CAPTURE_SDR_RTL433V2): $(DATASOURCE_COMMON_A) FORCE
 $(CAPTURE_SDR_RTLADSBV2): $(DATASOURCE_COMMON_A) FORCE
 	(cd capture_sdr_rtladsb_v2 && $(MAKE))
 
+$(CAPTURE_SDR_RTLAIS): $(DATASOURCE_COMMON_A) FORCE
+	(cd capture_sdr_rtlais && $(MAKE))
+
 $(CAPTURE_HACKRF_SWEEP):	$(DATASOURCE_COMMON_A) $(CAPTURE_HACKRF_SWEEP_O)
 	$(CC) $(LDFLAGS) -o $(CAPTURE_HACKRF_SWEEP) $(CAPTURE_HACKRF_SWEEP_O) $(DATASOURCE_COMMON_A) -lhackrf -lfftw3 $(LIBMLIB) -lpthread -lm
 
@@ -424,11 +452,23 @@ $(CAPTURE_FREAKLABS_ZIGBEEV2): $(DATASOURCE_COMMON_A) FORCE
 $(CAPTURE_CATSNIFFER_ZIGBEE): $(DATASOURCE_COMMON_A) FORCE
 	(cd capture_catsniffer_zigbee && $(MAKE))
 
+$(CAPTURE_SNIFFLE_BLE): $(DATASOURCE_COMMON_A) FORCE
+	(cd capture_sniffle_ble && $(MAKE))
+
+$(CAPTURE_LORAPIPE): $(DATASOURCE_COMMON_A) FORCE
+	(cd capture_lorapipe && $(MAKE))
+
 $(CAPTURE_BLADERF_WIPHY): $(DATASOURCE_COMMON_A) FORCE
 	(cd capture_bladerf_wiphy && $(MAKE))
 
 $(CAPTURE_HAK5_COCONUT): $(DATASOURCE_COMMON_A) FORCE
 	(cd capture_hak5_wifi_coconut && $(MAKE))
+
+$(CAPTURE_USBWIFI): $(DATASOURCE_COMMON_A) FORCE
+	(cd capture_userspace_usb_wifi && $(MAKE))
+
+$(CAPTURE_MM8108): $(DATASOURCE_COMMON_A) FORCE
+	(cd capture_morse_mm8108_usb_halow && $(MAKE))
 
 $(CAPTURE_SERIAL_RADVIEW): $(DATASOURCE_COMMON_A) FORCE
 	(cd capture_serial_radview && $(MAKE))
@@ -508,6 +548,18 @@ binsuidinstall: $(DATASOURCE_BINS)
 		$(INSTALL) -o $(INSTUSR) -g $(SUIDGROUP) -m 4550 $(CAPTURE_HAK5_COCONUT) $(BIN)/`basename $(CAPTURE_HAK5_COCONUT)` ; \
 	fi;
 
+	@if test "$(BUILD_CAPTURE_USBWIFI)"x = "1"x; then \
+		$(INSTALL) -o $(INSTUSR) -g $(SUIDGROUP) -m 4550 $(CAPTURE_USBWIFI) $(BIN)/`basename $(CAPTURE_USBWIFI)` && \
+		mkdir -p $(SHARE)/firmware/mediatek && \
+		cp -R capture_userspace_usb_wifi/firmware/* $(SHARE)/firmware/ ; \
+	fi;
+
+	@if test "$(BUILD_CAPTURE_MM8108)"x = "1"x; then \
+		$(INSTALL) -o $(INSTUSR) -g $(SUIDGROUP) -m 4550 $(CAPTURE_MM8108) $(BIN)/`basename $(CAPTURE_MM8108)` && \
+		mkdir -p $(SHARE)/firmware/morse && \
+		cp -R capture_morse_mm8108_usb_halow/firmware/morse/* $(SHARE)/firmware/morse/ ; \
+	fi;
+
 	@if test "$(BUILD_CAPTURE_SERIAL_RADVIEW)"x = "1"x; then \
 		$(INSTALL) -o $(INSTUSR) -g $(SUIDGROUP) -m 4550 $(CAPTURE_SERIAL_RADVIEW) $(BIN)/`basename $(CAPTURE_SERIAL_RADVIEW)` ; \
 	fi;
@@ -524,6 +576,10 @@ binsuidinstall: $(DATASOURCE_BINS)
 		$(INSTALL) -o $(INSTUSR) -g $(SUIDGROUP) -m 4550 $(CAPTURE_SDR_RTLADSBV2) $(BIN)/`basename $(CAPTURE_SDR_RTLADSBV2)` ; \
 	fi;
 
+	@if test "$(BUILD_CAPTURE_SDR_RTLAIS)"x = "1"x; then \
+		$(INSTALL) -o $(INSTUSR) -g $(SUIDGROUP) -m 4550 $(CAPTURE_SDR_RTLAIS) $(BIN)/`basename $(CAPTURE_SDR_RTLAIS)` ; \
+	fi;
+
 	@if test "$(BUILD_CAPTURE_FREAKLABS_ZIGBEEV2)"x = "1"x; then \
 		$(INSTALL) -o $(INSTUSR) -g $(SUIDGROUP) -m 4550 $(CAPTURE_FREAKLABS_ZIGBEEV2) $(BIN)/`basename $(CAPTURE_FREAKLABS_ZIGBEEV2)` ; \
 	fi;
@@ -532,12 +588,21 @@ binsuidinstall: $(DATASOURCE_BINS)
 		$(INSTALL) -o $(INSTUSR) -g $(SUIDGROUP) -m 4550 $(CAPTURE_CATSNIFFER_ZIGBEE) $(BIN)/`basename $(CAPTURE_CATSNIFFER_ZIGBEE)` ; \
 	fi;
 
+	@if test "$(BUILD_CAPTURE_LORAPIPE)"x = "1"x; then \
+		$(INSTALL) -o $(INSTUSR) -g $(SUIDGROUP) -m 4550 $(CAPTURE_LORAPIPE) $(BIN)/`basename $(CAPTURE_LORAPIPE)` ; \
+	fi;
+
+	@if test "$(BUILD_CAPTURE_SNIFFLE_BLE)"x = "1"x; then \
+		$(INSTALL) -o $(INSTUSR) -g $(SUIDGROUP) -m 4550 $(CAPTURE_SNIFFLE_BLE) $(BIN)/`basename $(CAPTURE_SNIFFLE_BLE)` ; \
+	fi;
+
 	@if test "$(BUILD_CAPTURE_WCH_BLE_ANALYZER_PRO)"x = "1"x; then \
 		$(INSTALL) -o $(INSTUSR) -g $(SUIDGROUP) -m 4550 $(CAPTURE_WCH_BLE_ANALYZER_PRO) $(BIN)/`basename $(CAPTURE_WCH_BLE_ANALYZER_PRO)` ; \
 	fi;
 
 commoninstall: $(INSTBINS)
 	mkdir -p $(ETC)
+	mkdir -p $(ETC)/kismet_site.d
 	mkdir -p $(BIN)
 
 	$(INSTALL) -o $(INSTUSR) -g $(INSTGRP) -m 555 $(PS) $(BIN)/$(PS);
@@ -629,7 +694,7 @@ commoninstall: $(INSTBINS)
 	fi;
 
 	@if test "$(BUILD_CAPTURE_RZ_KILLERBEE)"x = "1"x; then \
-		$(INSTALL) -o $(INSTUSR) -g $(SUIDGROUP) -m 4550 $(CAPTURE_RZ_KILLERBEE) $(BIN)/`basename $(CAPTURE_RZ_KILLERBEE)`; \
+		$(INSTALL) -o $(INSTUSR) -g $(INSTGRP) $(CAPTURE_RZ_KILLERBEE) $(BIN)/`basename $(CAPTURE_RZ_KILLERBEE)`; \
 	fi;
 
 	@if test "$(BUILD_CAPTURE_BLADERF_WIPHY)"x = "1"x; then \
@@ -643,6 +708,18 @@ commoninstall: $(INSTBINS)
 		cp capture_hak5_wifi_coconut/libwifiuserspace/firmware/rt2870.bin $(SHARE)/firmware/ ; \
 	fi;
 
+	@if test "$(BUILD_CAPTURE_USBWIFI)"x = "1"x; then \
+		$(INSTALL) -o $(INSTUSR) -g $(INSTGRP) $(CAPTURE_USBWIFI) $(BIN)/`basename $(CAPTURE_USBWIFI)` && \
+		mkdir -p $(SHARE)/firmware/mediatek && \
+		cp -R capture_userspace_usb_wifi/firmware/* $(SHARE)/firmware/ ; \
+	fi;
+
+	@if test "$(BUILD_CAPTURE_MM8108)"x = "1"x; then \
+		$(INSTALL) -o $(INSTUSR) -g $(INSTGRP) $(CAPTURE_MM8108) $(BIN)/`basename $(CAPTURE_MM8108)` && \
+		mkdir -p $(SHARE)/firmware/morse && \
+		cp -R capture_morse_mm8108_usb_halow/firmware/morse/* $(SHARE)/firmware/morse/ ; \
+	fi;
+
 	@if test "$(BUILD_CAPTURE_SDR_RTL433V2)"x = "1"x; then \
 		$(INSTALL) -o $(INSTUSR) -g $(INSTGRP) $(CAPTURE_SDR_RTL433V2) $(BIN)/`basename $(CAPTURE_SDR_RTL433V2)`; \
 	fi;
@@ -651,12 +728,24 @@ commoninstall: $(INSTBINS)
 		$(INSTALL) -o $(INSTUSR) -g $(INSTGRP) $(CAPTURE_SDR_RTLADSBV2) $(BIN)/`basename $(CAPTURE_SDR_RTLADSBV2)`; \
 	fi;
 
+	@if test "$(BUILD_CAPTURE_SDR_RTLAIS)"x = "1"x; then \
+		$(INSTALL) -o $(INSTUSR) -g $(INSTGRP) $(CAPTURE_SDR_RTLAIS) $(BIN)/`basename $(CAPTURE_SDR_RTLAIS)`; \
+	fi;
+
 	@if test "$(BUILD_CAPTURE_FREAKLABS_ZIGBEEV2)"x = "1"x; then \
 		$(INSTALL) -o $(INSTUSR) -g $(INSTGRP) $(CAPTURE_FREAKLABS_ZIGBEEV2) $(BIN)/`basename $(CAPTURE_FREAKLABS_ZIGBEEV2)`; \
 	fi;
 
 	@if test "$(BUILD_CAPTURE_CATSNIFFER_ZIGBEE)"x = "1"x; then \
 		$(INSTALL) -o $(INSTUSR) -g $(INSTGRP) $(CAPTURE_CATSNIFFER_ZIGBEE) $(BIN)/`basename $(CAPTURE_CATSNIFFER_ZIGBEE)`; \
+	fi;
+
+	@if test "$(BUILD_CAPTURE_SNIFFLE_BLE)"x = "1"x; then \
+		$(INSTALL) -o $(INSTUSR) -g $(INSTGRP) $(CAPTURE_SNIFFLE_BLE) $(BIN)/`basename $(CAPTURE_SNIFFLE_BLE)`; \
+	fi;
+
+	@if test "$(BUILD_CAPTURE_LORAPIPE)"x = "1"x; then \
+		$(INSTALL) -o $(INSTUSR) -g $(INSTGRP) $(CAPTURE_LORAPIPE) $(BIN)/`basename $(CAPTURE_LORAPIPE)`; \
 	fi;
 
 	@if test "$(BUILD_CAPTURE_WCH_BLE_ANALYZER_PRO)"x = "1"x; then \
@@ -696,8 +785,9 @@ configsinstall: $(CONFINSTTARGETS)
 	@echo "    make forceconfigs";
 	@echo 
 	@echo "You can simplify future configuration changes by using the ";
-	@echo "kismet_site.conf config file, for more info see the docs at:";
-	@echo "https://www.kismetwireless.net/docs/readme/config_files/";
+	@echo "kismet_site.conf config file or the kismet_site.d directory, for ";
+	@echo "more info see the docs at:";
+	@echo "https://www.kismetwireless.net/docs/readme/configuring/configfiles/";
 	@echo
 	@echo
 
@@ -817,6 +907,7 @@ rpm:
 depclean:
 	@-rm -f *.d
 	@-rm -f bluetooth_parsers/*.d
+	@-rm -f uav_parsers/*.d
 	@-rm -f dot11_parsers/*.d
 	@-rm -f log_tools/*.d
 	@-rm -f protobuf_cpp/*.d
@@ -827,6 +918,7 @@ clean: all-plugins-clean depclean
 	@-rm -f protobuf_cpp/*.o
 	@-rm -f dot11_parsers/*.o
 	@-rm -f bluetooth_parsers/*.o
+	@-rm -f uav_parsers/*.o
 	@-rm -f log_tools/*.o
 	@-rm -f $(PS)
 	@-rm -f $(CAPTURE_PCAPFILE)
@@ -843,9 +935,11 @@ clean: all-plugins-clean depclean
 	@(cd capture_openbsd_wifi && make clean)
 	@(cd capture_freaklabs_zigbee &&  make clean)
 	@(cd capture_catsniffer_zigbee &&  make clean)
+	@(cd capture_sniffle_ble &&  make clean)
 	# @(cd capture_sdr_rtl433 && make clean)
 	# @(cd capture_sdr_rtlamr && make clean)
 	# @(cd capture_sdr_rtladsb && make clean)
+	@(cd capture_sdr_rtlais && make clean)
 	@(cd capture_nrf_mousejack && make clean)
 	@(cd capture_ti_cc_2540 && make clean)
 	@(cd capture_ti_cc_2531 && make clean)
@@ -855,6 +949,8 @@ clean: all-plugins-clean depclean
 	@(cd capture_nxp_kw41z && make clean)
 	@(cd capture_rz_killerbee && make clean)
 	@(cd capture_hak5_wifi_coconut && make clean)
+	@(cd capture_userspace_usb_wifi && make clean)
+	@(cd capture_morse_mm8108_usb_halow && make clean)
 	@(cd capture_serial_radview && make clean)
 	@(cd capture_radiacode && make clean)
 	@(cd capture_antsdr_droneid && make clean)
@@ -903,7 +999,7 @@ all-plugins all-plugins-install all-plugins-userinstall all-plugins-clean: all-%
 # Disabled
 # kaitai-parsers:
 # 	@echo "Re-generating the kaitai_struct parsers requires the gpl3 licensed "
-# 	@echo "kaitai_struct compiler; see http://http://kaitai.io/ for more info!"
+# 	@echo "kaitai_struct compiler; see https://kaitai.io/ for more info!"
 # 	kaitai-struct-compiler --outdir kaitai_parsers/ -t cpp_stl -I kaitai_definitions/ kaitai_definitions/*.ksy
 # 	file-rename -v -f 's/\.cpp$$/\.cc/' kaitai_parsers/*.cpp 
 
@@ -913,6 +1009,9 @@ protobuf_cpp/%.pb.cc: protobuf_definitions/%.proto
 	$(PROTOCBIN) --cpp_out=./protobuf_cpp/ -I protobuf_definitions/ protobuf_definitions/$*.proto
 protobuf_cpp/%.pb.h: protobuf_definitions/%.proto
 	$(PROTOCBIN) --cpp_out=./protobuf_cpp/ -I protobuf_definitions/ protobuf_definitions/$*.proto
+
+# Decompression libraries for firmware files
+firmware_file.c.o firmware_file.c.d: CFLAGS += $(FIRMWARECFLAGS)
 
 %.c.o:	%.c
 %.c.o : %.c %.c.d

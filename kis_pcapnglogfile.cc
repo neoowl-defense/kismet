@@ -22,6 +22,9 @@
 #include "kis_pcapnglogfile.h"
 #include "messagebus.h"
 
+#include <algorithm>
+#include <ctime>
+
 kis_pcapng_logfile::kis_pcapng_logfile(shared_log_builder in_builder) :
     kis_logfile(in_builder) {
     buffer = new future_chainbuf(4096, 1024);
@@ -39,6 +42,15 @@ kis_pcapng_logfile::kis_pcapng_logfile(shared_log_builder in_builder) :
     max_size = 
         Globalreg::globalreg->kismet_config->fetch_opt_ulong("pcapng_log_max_mb", 0L);
     max_size = max_size * 1024 * 1024;
+
+    // How far the writer may fall behind before packets are dropped (or wait, when
+    // blocking); at least 1MB
+    buffer_backlog =
+        Globalreg::globalreg->kismet_config->fetch_opt_ulong("pcapng_log_buffer_mb", PCAPNG_LOG_DEFAULT_BUFFER_MB);
+    buffer_backlog = std::max<size_t>(buffer_backlog, 1) * 1024 * 1024;
+
+    block_on_buffer =
+        Globalreg::globalreg->kismet_config->fetch_opt_bool("pcapng_log_blocking", false);
 
     auto packetchain = Globalreg::fetch_mandatory_global_as<packet_chain>("PACKETCHAIN");
     pack_comp_l1data = packetchain->register_packet_component("L1RAW");
@@ -86,7 +98,8 @@ bool kis_pcapng_logfile::open_log(const std::string& in_template,
 
     pcapng = new pcapng_stream_packetchain(buffer, 
             pcapng_logfile_accept_ftor(log_duplicate_packets, log_data_packets),
-            pcapng_logfile_select_ftor(truncate_duplicate_packets), (size_t) 16384);
+            pcapng_logfile_select_ftor(truncate_duplicate_packets), buffer_backlog,
+            block_on_buffer);
 
     _MSG_INFO("Opened pcapng log file '{}'", in_path);
 
@@ -109,7 +122,7 @@ bool kis_pcapng_logfile::open_log(const std::string& in_template,
                     if (fwrite(data, sz, 1, pcapng_file) == 0) {
                         _MSG_ERROR("Error writing to pcapng log '{}' - {}", get_log_path(),
                                 kis_strerror_r(errno));
-                        close_log();
+                        writer_failed();
                         return;
                     }
                 }
@@ -117,6 +130,8 @@ bool kis_pcapng_logfile::open_log(const std::string& in_template,
                 buffer->consume(sz);
 
                 log_size += sz;
+
+                report_drops(false);
 
                 // Flush the buffer, close the log, and make a new one
                 if (log_size >= max_size && max_size != 0) {
@@ -134,8 +149,25 @@ bool kis_pcapng_logfile::open_log(const std::string& in_template,
 }
 
 void kis_pcapng_logfile::rotate_log() {
-    // Rotate log is called inside the stream lambda, so the stream lambda thread 
-    // can't be touching the old log
+    // Runs on the writer thread; errors must not call close_log(), which joins this thread
+
+    auto logtracker = 
+        Globalreg::fetch_mandatory_global_as<log_tracker>();
+
+    auto logpath =
+        logtracker->expand_template(get_log_template(), builder->get_log_class());
+
+    // Open the new file before swapping anything, so a failure leaves the current log
+    // running instead of losing packets; rotation is retried after another max_size
+    auto new_file = fopen(logpath.c_str(), "w");
+
+    if (new_file == nullptr) {
+        _MSG_ERROR("Failed to open new pcapng log '{}' - {}; continuing to log to '{}'",
+                logpath, kis_strerror_r(errno), get_log_path());
+        return;
+    }
+
+    _MSG_INFO("Rotating to new pcapng log {}", logpath);
 
     // Move the old buffer and file, replace with new
     auto old_buffer = buffer;
@@ -145,25 +177,8 @@ void kis_pcapng_logfile::rotate_log() {
     // Reset the buffer and pcap log; this will make a new SHB in the new buffer
     // immediately, and leave the remnants of the old packets in the old buffer
     buffer = pcapng->restart_stream(new future_chainbuf(4096, 1024));
-
-    // Generate a new log file from the template and open it
-    auto logtracker = 
-        Globalreg::fetch_mandatory_global_as<log_tracker>();
-
-    auto logpath =
-        logtracker->expand_template(get_log_template(), builder->get_log_class());
+    pcapng_file = new_file;
     set_int_log_path(logpath);
-
-    _MSG_INFO("Rotating to new pcapng log {}", logpath);
-
-    pcapng_file = fopen(logpath.c_str(), "w");
-
-    if (pcapng_file == nullptr) {
-        _MSG_ERROR("Failed to open pcapng log '{}' - {}",
-                logpath, kis_strerror_r(errno));
-        close_log();
-        return;
-    }
 
     // Flush out the contents of the old buffer direct to the old file; the buffer will
     // empty because the stream has the new buffer assigned already
@@ -176,7 +191,9 @@ void kis_pcapng_logfile::rotate_log() {
             if (fwrite(data, sz, 1, old_pcapng_file) == 0) {
                 _MSG_ERROR("Error writing to pcapng log '{}' - {}", old_path,
                         kis_strerror_r(errno));
-                close_log();
+                fclose(old_pcapng_file);
+                delete old_buffer;
+                writer_failed();
                 return;
             }
         }
@@ -191,15 +208,69 @@ void kis_pcapng_logfile::rotate_log() {
     // Return to the packet handling loop thread and let it start processing packets again
 }
 
+void kis_pcapng_logfile::report_drops(bool final) {
+    if (pcapng == nullptr)
+        return;
+
+    const auto dropped = pcapng->get_dropped_packets();
+
+    if (dropped == reported_drops)
+        return;
+
+    const auto now = time(nullptr);
+
+    if (!final && now - last_drop_report < 10)
+        return;
+
+    const auto msg = fmt::format("pcapng log '{}' dropped {} packets ({} total) because writing "
+            "the log could not keep up; increase pcapng_log_buffer_mb, or set "
+            "pcapng_log_blocking=true to log every packet", get_log_path(),
+            dropped - reported_drops, dropped);
+
+    // Logs are closed after the message bus stops printing during shutdown
+    if (Globalreg::globalreg->spindown)
+        fmt::print(stderr, "ERROR: {}\n", msg);
+    else
+        _MSG_ERROR("{}", msg);
+
+    reported_drops = dropped;
+    last_drop_report = now;
+}
+
+void kis_pcapng_logfile::writer_failed() {
+    set_int_log_open(false);
+
+    // Skip the per-packet work until close_log() removes the stream
+    if (pcapng != nullptr)
+        pcapng->pause_stream();
+
+    buffer->cancel();
+
+    if (pcapng_file != nullptr)
+        fclose(pcapng_file);
+
+    pcapng_file = nullptr;
+}
+
 void kis_pcapng_logfile::close_log() {
     kis_lock_guard<kis_mutex> lk(log_mutex);
 
     set_int_log_open(false);
 
+    // Stop the writer first; it uses the stream, so the stream is removed only after
     buffer->cancel();
 
     if (stream_t.joinable())
         stream_t.join();
+
+    report_drops(true);
+
+    // Deleting the stream removes its packet handler, which waits for any packet thread
+    // still running it
+    if (pcapng != nullptr) {
+        delete pcapng;
+        pcapng = nullptr;
+    }
 
     if (pcapng_file)
         fclose(pcapng_file);

@@ -75,10 +75,6 @@ int kis_dlt_ppi::handle_packet(const std::shared_ptr<kis_packet>& in_pack) {
     unsigned int ppi_dlt = -1;
     int applyfcs = 0, fcsknownbad = 0;
 
-    // Make a datachunk for the reformatted frame
-    std::shared_ptr<kis_layer1_packinfo> radioheader;
-    std::shared_ptr<kis_gps_packinfo> gpsinfo;
-
     if (linkchunk->length() < sizeof(ppi_packet_header)) {
         _MSG("pcap PPI converter got runt PPI frame", MSGFLAG_ERROR);
         return 0;
@@ -87,7 +83,7 @@ int kis_dlt_ppi::handle_packet(const std::shared_ptr<kis_packet>& in_pack) {
     ppi_ph = reinterpret_cast<const ppi_packet_header *>(linkchunk->data());
     ph_len = kis_letoh16(ppi_ph->pph_len);
     ppi_dlt = kis_letoh32(ppi_ph->pph_dlt);
-    if (ph_len > linkchunk->length()) {
+    if (ph_len < sizeof(ppi_packet_header) || ph_len > linkchunk->length()) {
         _MSG("pcap PPI converter got invalid/runt PPI frame header", MSGFLAG_ERROR);
         return 0;
     }
@@ -101,12 +97,18 @@ int kis_dlt_ppi::handle_packet(const std::shared_ptr<kis_packet>& in_pack) {
             ph_len = 32;
     }
 
-    while (ppi_fh_offt < linkchunk->length() && ppi_fh_offt < ph_len) {
+    while (ppi_fh_offt < ph_len) {
+        const unsigned int remaining = ph_len - ppi_fh_offt;
+        if (remaining < sizeof(ppi_field_header)) {
+            _MSG("pcap PPI converter got runt PPI field header", MSGFLAG_ERROR);
+            return 0;
+        }
+
         ppi_fh = reinterpret_cast<const ppi_field_header *>(&linkchunk->data()[ppi_fh_offt]);
         unsigned int fh_len = kis_letoh16(ppi_fh->pfh_datalen);
         unsigned int fh_type = kis_letoh16(ppi_fh->pfh_datatype);
 
-        if (fh_len > linkchunk->length() || fh_len > ph_len) {
+        if (fh_len > remaining - sizeof(ppi_field_header)) {
             _MSG("pcap PPI converter got corrupt/invalid PPI field length", MSGFLAG_ERROR);
             return 0;
         }
@@ -114,6 +116,10 @@ int kis_dlt_ppi::handle_packet(const std::shared_ptr<kis_packet>& in_pack) {
         ppi_fh_offt += fh_len + sizeof(ppi_field_header);
 
         if (fh_type == PPI_FIELD_11COMMON) {
+            if (fh_len < sizeof(ppi_80211_common) - sizeof(ppi_field_header)) {
+                _MSG("pcap PPI converter got runt 802.11 common field", MSGFLAG_ERROR);
+                return 0;
+            }
             // printf("debug - 80211 common\n");
             ppi_80211_common *ppic = (ppi_80211_common *) ppi_fh;
 
@@ -134,66 +140,85 @@ int kis_dlt_ppi::handle_packet(const std::shared_ptr<kis_packet>& in_pack) {
                 fcsknownbad = 1;
             }
 
-            if (radioheader == nullptr)
-                radioheader = packetchain->new_packet_component<kis_layer1_packinfo>();
+			in_pack->signal_info.data_ok = true;
 
             // Channel flags
             tuint = kis_letoh16(ppic->chan_flags);
             if (tuint & PPI_80211_CHFLAG_CCK) 
-                radioheader->encoding = encoding_cck;
+                in_pack->signal_info.encoding = encoding_cck;
             if (tuint & PPI_80211_CHFLAG_OFDM) 
-                radioheader->encoding = encoding_ofdm;
+                in_pack->signal_info.encoding = encoding_ofdm;
             if (tuint & PPI_80211_CHFLAG_DYNAMICCCK) 
-                radioheader->encoding = encoding_dynamiccck;
+                in_pack->signal_info.encoding = encoding_dynamiccck;
             if (tuint & PPI_80211_CHFLAG_GFSK) 
-                radioheader->encoding = encoding_gfsk;
+                in_pack->signal_info.encoding = encoding_gfsk;
             if (tuint & PPI_80211_CHFLAG_TURBO)
-                radioheader->carrier = carrier_80211bplus;
+                in_pack->signal_info.carrier = carrier_80211bplus;
             if ((tuint & PPI_80211_CHFLAG_OFDM) &&
                     (tuint & PPI_80211_CHFLAG_2GHZ))
-                radioheader->carrier = carrier_80211g;
+                in_pack->signal_info.carrier = carrier_80211g;
             if (tuint & PPI_80211_CHFLAG_5GHZ)
-                radioheader->carrier = carrier_80211a;
+                in_pack->signal_info.carrier = carrier_80211a;
 
-            radioheader->signal_type = kis_l1_signal_type_dbm;
-            radioheader->signal_dbm = ppic->signal_dbm;
-            radioheader->noise_dbm = ppic->noise_dbm;
+            in_pack->signal_info.signal_type = kis_l1_signal_type_dbm;
+            in_pack->signal_info.signal_dbm = ppic->signal_dbm;
+            in_pack->signal_info.noise_dbm = ppic->noise_dbm;
 
-            radioheader->datarate = kis_letoh16(ppic->rate) * 5;
+            in_pack->signal_info.datarate = kis_letoh16(ppic->rate) * 5;
 
-            radioheader->freq_khz = kis_letoh16(ppic->freq_mhz) * 1000;
+            in_pack->signal_info.freq_khz = kis_letoh16(ppic->freq_mhz) * 1000;
         } else if (fh_type == PPI_FIELD_11NMAC) {
+            if (fh_len < sizeof(ppi_11n_mac) - sizeof(ppi_field_header)) {
+                _MSG("pcap PPI converter got runt 802.11n MAC field", MSGFLAG_ERROR);
+                return 0;
+            }
             ppi_11n_mac *ppin = (ppi_11n_mac *) ppi_fh;
 
-            if (radioheader == nullptr)
-                radioheader = packetchain->new_packet_component<kis_layer1_packinfo>();
+			in_pack->signal_info.data_ok = true;
 
             // Decode greenfield notation
             tuint = kis_letoh16(ppin->flags);
             if (tuint & PPI_11NMAC_HT2040)
-                radioheader->carrier = carrier_80211n20;
+				in_pack->signal_info.carrier = carrier_80211n20;
             else
-                radioheader->carrier = carrier_80211n40;
+				in_pack->signal_info.carrier = carrier_80211n40;
 
         } else if (fh_type == PPI_FIELD_11NMACPHY) {
+            if (fh_len < sizeof(ppi_11n_macphy) - sizeof(ppi_field_header)) {
+                _MSG("pcap PPI converter got runt 802.11n MAC/PHY field", MSGFLAG_ERROR);
+                return 0;
+            }
             ppi_11n_macphy *ppinp = (ppi_11n_macphy *) ppi_fh;
 
-            if (radioheader == nullptr)
-                radioheader = packetchain->new_packet_component<kis_layer1_packinfo>();
+			in_pack->signal_info.data_ok = true;
 
             // Decode greenfield notation
             tuint = kis_letoh16(ppinp->flags);
             if (tuint & PPI_11NMAC_HT2040)
-                radioheader->carrier = carrier_80211n20;
+                in_pack->signal_info.carrier = carrier_80211n20;
             else
-                radioheader->carrier = carrier_80211n40;
+                in_pack->signal_info.carrier = carrier_80211n40;
         } else if (fh_type == PPI_FIELD_GPS) {
+            // The outer PPI field header is not part of the inner GPS length.
+            const unsigned int gps_header_len =
+                sizeof(ppi_gps_hdr) - sizeof(ppi_field_header);
+            if (fh_len < gps_header_len) {
+                _MSG("pcap PPI converter got runt GPS field", MSGFLAG_ERROR);
+                return 0;
+            }
+
             ppi_gps_hdr *ppigps = (ppi_gps_hdr *) ppi_fh;
 
             if (ppigps->version == 0) {
+                const unsigned int declared_gps_len = kis_letoh16(ppigps->gps_len);
+                if (declared_gps_len < gps_header_len || declared_gps_len > fh_len) {
+                    _MSG("pcap PPI converter got invalid GPS length", MSGFLAG_ERROR);
+                    return 0;
+                }
+
                 unsigned int data_offt = 0;
                 uint32_t fields_present = kis_letoh32(ppigps->fields_present);
-                uint16_t gps_len = kis_letoh16(ppigps->gps_len) - sizeof(ppi_gps_hdr);
+                const unsigned int gps_len = declared_gps_len - gps_header_len;
 
                 union block {
                     uint8_t u8;
@@ -206,21 +231,20 @@ int kis_dlt_ppi::handle_packet(const std::shared_ptr<kis_packet>& in_pack) {
 
                 if ((fields_present & PPI_GPS_FLAG_LAT) &&
                         (fields_present & PPI_GPS_FLAG_LON) &&
-                        gps_len - data_offt >= 8) {
+                        gps_len >= data_offt + 8) {
 
-                    if (gpsinfo == nullptr)
-                        gpsinfo = packetchain->new_packet_component<kis_gps_packinfo>();
+					in_pack->gps_info.gps_info_ok = true;
 
                     u = (block *) &(ppigps->field_data[data_offt]);
-                    gpsinfo->lat = fixed3_7_to_double(kis_letoh32(u->u32));
+                    in_pack->gps_info.lat = fixed3_7_to_double(kis_letoh32(u->u32));
                     data_offt += 4;
 
                     u = (block *) &(ppigps->field_data[data_offt]);
-                    gpsinfo->lon = fixed3_7_to_double(kis_letoh32(u->u32));
+                    in_pack->gps_info.lon = fixed3_7_to_double(kis_letoh32(u->u32));
                     data_offt += 4;
 
-                    gpsinfo->fix = 2;
-                    gpsinfo->alt = 0;
+                    in_pack->gps_info.fix = 2;
+                    in_pack->gps_info.alt = 0;
 
                     // gpsinfo->gpsname = "PPI";
                 }
@@ -236,24 +260,22 @@ int kis_dlt_ppi::handle_packet(const std::shared_ptr<kis_packet>& in_pack) {
                    }
                    */
 
-                if ((fields_present & PPI_GPS_FLAG_ALT) && gps_len - data_offt >= 4) {
-                    if (gpsinfo == nullptr) {
-                        gpsinfo = packetchain->new_packet_component<kis_gps_packinfo>();
-                        gpsinfo->fix = 0;
-                        // gpsinfo->gpsname = "PPI";
-                    } else {
-                        gpsinfo->fix = 3;
-                    }
+                if ((fields_present & PPI_GPS_FLAG_ALT) && gps_len >= data_offt + 4) {
+					in_pack->gps_info.gps_info_ok = true;
+					in_pack->gps_info.fix = 3;
 
                     u = (block *) &(ppigps->field_data[data_offt]);
-                    gpsinfo->alt = fixed6_4_to_double(kis_letoh32(u->u32));
+                    in_pack->gps_info.alt = fixed6_4_to_double(kis_letoh32(u->u32));
                     data_offt += 4;
                 }
-
-                in_pack->insert(pack_comp_gps, gpsinfo);
             }
         }
     }
+
+    // A frame captured shorter than it was (snap length, truncation) doesn't have its FCS,
+    // whatever the flags say; a known bad FCS still counts
+    if (applyfcs && !fcsknownbad && in_pack->original_len > linkchunk->length())
+        applyfcs = 0;
 
     if (applyfcs)
         applyfcs = 4;
@@ -265,10 +287,6 @@ int kis_dlt_ppi::handle_packet(const std::shared_ptr<kis_packet>& in_pack) {
     // Alias the decapsulated data
     auto len = kismin((linkchunk->length() - ph_len - applyfcs), (uint32_t) MAX_PACKET_LEN);
     decapchunk->set_data(linkchunk->substr(ph_len, len));
-
-    if (radioheader != NULL) {
-        in_pack->insert(pack_comp_radiodata, radioheader);
-    }
 
     in_pack->insert(pack_comp_decap, decapchunk);
 

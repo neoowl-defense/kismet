@@ -22,13 +22,17 @@
 #include "config.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <list>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <time.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -103,6 +107,11 @@ public:
     void append_signal(const kis_layer1_packinfo& lay1, bool update_rrd, time_t rrd_ts);
     void append_signal(const packinfo_sig_combo& in, bool update_rrd, time_t rrd_ts);
 
+    // update_range also records the weakest and strongest signal over time; only the
+    // device's own signal keeps that, not the per-datasource records
+    void append_signal(const kis_layer1_packinfo *lay1, const kis_gps_packinfo *gps,
+            bool update_rrd, time_t rrd_ts, bool update_range = false);
+
     __ProxyGet(signal_type, std::string, std::string, signal_type);
 
     __ProxyGet(last_signal, int32_t, int, last_signal);
@@ -119,6 +128,11 @@ public:
 
     __ProxyFullyDynamicTrackable(signal_min_rrd, kis_tracked_minute_rrd<kis_tracked_rrd_peak_signal_aggregator>,
                                  signal_min_rrd_id);
+
+    __ProxyFullyDynamicTrackable(range_min_rrd, kis_tracked_rrd<kis_tracked_rrd_min_signal_aggregator>,
+                                 range_min_rrd_id);
+    __ProxyFullyDynamicTrackable(range_max_rrd, kis_tracked_rrd<kis_tracked_rrd_max_signal_aggregator>,
+                                 range_max_rrd_id);
 
     __ProxyFullyDynamicTrackable(peak_loc, kis_tracked_location_triplet, peak_loc_id);
 
@@ -145,6 +159,12 @@ protected:
     // Signal record over the past minute, either rssi or dbm.  Devices
     // should not mix rssi and dbm signal reporting.
     uint16_t signal_min_rrd_id;
+
+    // Weakest and strongest signal per second, minute, and hour, over the past day
+    uint16_t range_min_rrd_id;
+    uint16_t range_max_rrd_id;
+
+    void add_range_sample(double signal, time_t rrd_ts);
 
     int sig_type;
 };
@@ -313,6 +333,50 @@ protected:
 #define KIS_DEVICE_BASICCRYPT_WEAKCRYPT	(1 << 4)
 #define KIS_DEVICE_BASICCRYPT_DECRYPTED	(1 << 5)
 
+// device_mutex is not recursive; each thread records the devices it holds so that nested
+// locking (such as serializing a device inside a locked device worker) doesn't deadlock
+struct kis_device_lock_entry {
+    const void *device;
+    unsigned int depth;
+    bool shared;
+    // The device list lock was taken on behalf of this device
+    bool list_locked;
+};
+
+inline thread_local std::vector<kis_device_lock_entry> kis_device_locks_held;
+
+// Lock order is the device list, then devices, then views.  Going backwards is reported
+// once per site; set KISMET_LOCK_ORDER_ABORT to abort instead so tests fail loudly.
+inline thread_local unsigned int kis_view_locks_held = 0;
+
+// The device tracker's device list lock, set by the device tracker
+inline kis_mutex *kis_devicelist_mutex = nullptr;
+
+inline bool kis_devicelist_owned() {
+    return kis_devicelist_mutex != nullptr && kis_devicelist_mutex->owned_by_this_thread();
+}
+
+inline void kis_lock_order_violation(const char *what, std::atomic<bool>& reported) {
+    static const bool abort_on_violation = getenv("KISMET_LOCK_ORDER_ABORT") != nullptr;
+
+    if (!reported.exchange(true))
+        fprintf(stderr, "LOCK ORDER VIOLATION: %s\n", what);
+
+    if (abort_on_violation)
+        abort();
+}
+
+// Call before acquiring the device list lock; re-locking a list lock this thread already
+// holds is not a violation
+#define KIS_CHECK_NO_DEVICE_LOCKS(where) \
+    do { \
+        if ((!kis_device_locks_held.empty() || kis_view_locks_held != 0) && !kis_devicelist_owned()) { \
+            static std::atomic<bool> kis_lock_order_reported{false}; \
+            kis_lock_order_violation(where " takes the device list while holding a device or view lock", \
+                    kis_lock_order_reported); \
+        } \
+    } while (0)
+
 // Base of all device tracking under the new trackerentry system
 class kis_tracked_device_base : public tracker_component {
 public:
@@ -339,6 +403,7 @@ public:
 
     kis_tracked_device_base(const kis_tracked_device_base *p) :
         tracker_component{p} {
+            device_mutex.set_name("device");
             __ImportField(key, p);
             __ImportField(macaddr, p);
             __ImportField(phyname, p);
@@ -397,6 +462,8 @@ public:
 
             __ImportId(location_cloud_id, p);
 
+            __ImportId(reported_location_id, p);
+            __ImportId(reported_location_cloud_id, p);
 
             reserve_fields(nullptr);
         }
@@ -469,11 +536,40 @@ public:
 
     __Proxy(commonname, std::string, std::string, std::string, commonname);
 
+    // try to return the "most appropriate" name for printing that a message came from this
+    // device.  user attached names are the most likely, then descend down the list
+    const std::string& get_most_apt_name() {
+        if (has_username()) {
+            if (username->length() != 0) {
+                return username->get();
+            }
+        }
+
+        if (devicename->length() != 0) {
+            return devicename->get();
+        }
+
+        return commonname->get();
+    }
+
     // __Proxy(type_string, std::string, std::string, std::string, type_string);
     __ProxySwappingTrackable(type_string, tracker_element_string, type_string);
 
     __Proxy(basic_type_set, uint64_t, uint64_t, uint64_t, basic_type_set);
     __ProxyBitset(basic_type_set, uint64_t, basic_type_set);
+
+    // Wired is only inferred from bridged traffic, so any sign of a radio (client or AP)
+    // clears it and keeps it from being set again; the result doesn't depend on the order
+    // packets are processed in
+    void bitset_basic_type_radio(uint64_t in_bits) {
+        bitset_basic_type_set(in_bits);
+        bitclear_basic_type_set(KIS_DEVICE_BASICTYPE_WIRED);
+    }
+
+    void bitset_basic_type_wired() {
+        if (!(get_basic_type_set() & (KIS_DEVICE_BASICTYPE_CLIENT | KIS_DEVICE_BASICTYPE_AP)))
+            bitset_basic_type_set(KIS_DEVICE_BASICTYPE_WIRED);
+    }
 
     __ProxyGet(type_string, std::string, std::string, type_string);
 
@@ -585,6 +681,10 @@ public:
     void inc_seenby_count(kis_datasource *source, time_t tv_sec, int frequency,
             packinfo_sig_combo *siginfo, bool update_rrd);
 
+    void inc_seenby_count(kis_datasource *source, time_t tv_sec, int frequency,
+            const kis_layer1_packinfo *lay1, const kis_gps_packinfo *gps,
+            bool update_rrd);
+
     __ProxyDynamicTrackable(tag_map, tracker_element_string_map, tag_map, tag_map_id);
 
     void set_server_uuid(std::shared_ptr<tracker_element_uuid> uuid) {
@@ -606,7 +706,129 @@ public:
     // Optional location cloud
     __ProxyFullyDynamicTrackable(location_cloud, kis_location_rrd, location_cloud_id);
 
+    // Where the device says it is, for devices that report their own position
+    // (ADS-B, AIS, Remote ID...); only present on those devices.  location and
+    // location_cloud always hold where kismet was when it heard the device.
+    //
+    // Major change to the location data (2026-10-R1, kismetdb v11): those phys
+    // previously wrote the reported position into location / location_cloud.
+    // Consumers that want the device's own position must read these fields.
+    __ProxyFullyDynamicTrackable(reported_location, kis_tracked_location, reported_location_id);
+    __ProxyFullyDynamicTrackable(reported_location_cloud, kis_location_rrd, reported_location_cloud_id);
+
     kis_shared_mutex device_mutex;
+
+    static constexpr unsigned int view_membership_capacity = 128;
+
+    // Safe default until the owning phy says otherwise
+    bool requires_list_lock{true};
+
+    std::array<std::atomic<uint64_t>, view_membership_capacity / 64> view_membership{};
+
+    std::atomic<bool> removed{false};
+
+    // Lock the device, or nest inside a lock this thread already holds.  An exclusive
+    // request while this thread holds only a shared lock can't be satisfied and throws.
+    void lock_device(bool shared) {
+        for (auto& e : kis_device_locks_held) {
+            if (e.device != this)
+                continue;
+
+            if (e.shared && !shared)
+                throw std::runtime_error("device lock upgrade from shared to exclusive");
+
+            e.depth++;
+            return;
+        }
+
+        if (kis_view_locks_held != 0) {
+            static std::atomic<bool> reported{false};
+            kis_lock_order_violation("device lock acquired while holding a view lock", reported);
+        }
+
+        // Devices from phys which don't lock devices are written under the device list
+        bool list_locked = false;
+
+        if (requires_list_lock && kis_devicelist_mutex != nullptr && !kis_devicelist_owned()) {
+            if (!kis_device_locks_held.empty()) {
+                static std::atomic<bool> reported{false};
+                kis_lock_order_violation("device list lock taken for a device while holding another device lock",
+                        reported);
+            }
+
+            kis_devicelist_mutex->lock();
+            list_locked = true;
+        }
+
+        if (shared)
+            device_mutex.lock_shared();
+        else
+            device_mutex.lock();
+
+        kis_device_locks_held.push_back({this, 1, shared, list_locked});
+    }
+
+    void unlock_device() {
+        for (auto i = kis_device_locks_held.begin(); i != kis_device_locks_held.end(); ++i) {
+            if (i->device != this)
+                continue;
+
+            if (--i->depth == 0) {
+                const bool list_locked = i->list_locked;
+
+                if (i->shared)
+                    device_mutex.unlock_shared();
+                else
+                    device_mutex.unlock();
+
+                kis_device_locks_held.erase(i);
+
+                if (list_locked)
+                    kis_devicelist_mutex->unlock();
+            }
+
+            return;
+        }
+    }
+
+    // Set from the phy at creation; see kis_phy_handler::uses_device_locking
+    void set_requires_list_lock(bool r) {
+        requires_list_lock = r;
+    }
+
+    // Set under the device lock when the device is expired from the tracker; anything
+    // holding a stale reference must look the device up again instead of updating it
+    bool get_removed() const {
+        return removed.load(std::memory_order_acquire);
+    }
+
+    void set_removed() {
+        removed.store(true, std::memory_order_release);
+    }
+
+    // Which views hold this device, so per-packet view updates can skip the view lock when
+    // membership doesn't change.  Only changed under the view's exclusive lock.
+    bool in_view(unsigned int index) const {
+        return (view_membership[index / 64].load(std::memory_order_acquire) >> (index % 64)) & 1;
+    }
+
+    void set_in_view(unsigned int index, bool in) {
+        const auto bit = uint64_t{1} << (index % 64);
+
+        if (in)
+            view_membership[index / 64].fetch_or(bit, std::memory_order_release);
+        else
+            view_membership[index / 64].fetch_and(~bit, std::memory_order_release);
+    }
+
+    // Serializers hold a shared lock on the device while reading it
+    virtual void pre_serialize() override {
+        lock_device(true);
+    }
+
+    virtual void post_serialize() override {
+        unlock_device();
+    }
 
 protected:
     virtual void register_fields() override;
@@ -721,12 +943,116 @@ protected:
     uint16_t related_device_group_id;
 
     uint16_t location_cloud_id;
+
+    // Device-reported position; see the proxies above, major change in 2026-10-R1
+    uint16_t reported_location_id;
+    uint16_t reported_location_cloud_id;
+};
+
+// Scoped device lock that tolerates nesting within the same thread
+class kis_device_lock {
+public:
+    // Unbound until lock(), such as when update_common_device hands back the device locked
+    kis_device_lock() :
+        device{nullptr} { }
+
+    kis_device_lock(kis_tracked_device_base *device, bool shared) :
+        device{device} {
+        device->lock_device(shared);
+    }
+
+    kis_device_lock(const std::shared_ptr<kis_tracked_device_base>& device, bool shared) :
+        kis_device_lock(device.get(), shared) { }
+
+    ~kis_device_lock() {
+        if (device != nullptr)
+            device->unlock_device();
+    }
+
+    void lock(kis_tracked_device_base *in_device, bool shared) {
+        if (device != nullptr)
+            throw std::runtime_error("kis_device_lock already holds a device");
+
+        in_device->lock_device(shared);
+        device = in_device;
+    }
+
+    void lock(const std::shared_ptr<kis_tracked_device_base>& in_device, bool shared) {
+        lock(in_device.get(), shared);
+    }
+
+    void unlock() {
+        if (device != nullptr) {
+            device->unlock_device();
+            device = nullptr;
+        }
+    }
+
+    kis_device_lock(const kis_device_lock&) = delete;
+    kis_device_lock& operator=(const kis_device_lock&) = delete;
+
+protected:
+    kis_tracked_device_base *device;
+};
+
+// Exclusive lock on two devices for updates which must change both together (such as a
+// client and its access point).  Devices are always locked in kis_internal_id order so
+// threads locking the same pair can't deadlock; either may be null, or both the same.
+class kis_device_pair_lock {
+public:
+    kis_device_pair_lock(const std::shared_ptr<kis_tracked_device_base>& a,
+            const std::shared_ptr<kis_tracked_device_base>& b) :
+        first{a.get()},
+        second{b.get()} {
+
+        if (first == second)
+            second = nullptr;
+
+        if (first == nullptr)
+            std::swap(first, second);
+
+        if (second != nullptr && second->get_kis_internal_id() < first->get_kis_internal_id())
+            std::swap(first, second);
+
+        // Holding any other device here could invert the order with another thread
+        for (const auto& e : kis_device_locks_held) {
+            if (e.device != first && e.device != second) {
+                static std::atomic<bool> reported{false};
+                kis_lock_order_violation("device pair lock taken while holding another device lock", reported);
+                break;
+            }
+        }
+
+        if (first != nullptr)
+            first->lock_device(false);
+
+        if (second != nullptr)
+            second->lock_device(false);
+    }
+
+    ~kis_device_pair_lock() {
+        if (second != nullptr)
+            second->unlock_device();
+
+        if (first != nullptr)
+            first->unlock_device();
+    }
+
+    kis_device_pair_lock(const kis_device_pair_lock&) = delete;
+    kis_device_pair_lock& operator=(const kis_device_pair_lock&) = delete;
+
+protected:
+    kis_tracked_device_base *first;
+    kis_tracked_device_base *second;
 };
 
 // Packinfo references
 class kis_tracked_device_info : public packet_component {
 public:
 	kis_tracked_device_info() { }
+
+    // Which devices this packet updated; per packet, so never borrowed by a duplicate
+    virtual bool unique() override { return true; }
 
     // We don't use mac masks here so an unordered map is safe
     std::unordered_map<mac_addr, std::shared_ptr<kis_tracked_device_base> > devrefs;

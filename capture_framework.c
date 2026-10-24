@@ -28,6 +28,7 @@
 #include <string.h>
 #include <strings.h>
 #include <netdb.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <fcntl.h>
 #include <string.h>
@@ -56,6 +57,10 @@
 #endif
 
 #include "capture_framework.h"
+
+#ifdef SYS_LINUX
+#include <sys/utsname.h>
+#endif
 #include "kis_external_packet.h"
 #include "kis_endian.h"
 #include "remote_announcement.h"
@@ -136,6 +141,46 @@ uint32_t adler32_csum(uint8_t *in_buf, size_t in_len) {
     return adler32_append_csum(in_buf, in_len, 0);
 }
 
+size_t cf_system_firmware_dirs(char dirs[CF_FIRMWARE_MAX_DIRS][CF_FIRMWARE_PATH_LEN]) {
+#ifdef SYS_LINUX
+    struct utsname un;
+    char custom[CF_FIRMWARE_PATH_LEN * 2];
+    bool release = false;
+    size_t n = 0;
+    FILE *f;
+
+    /* A release with a path separator can't be part of a directory name */
+    if (uname(&un) == 0 && un.release[0] != 0 && strchr(un.release, '/') == NULL &&
+            strcmp(un.release, "..") != 0 && strcmp(un.release, ".") != 0)
+        release = true;
+
+    /* Set on the kernel command line or by the distribution; empty if unset */
+    if ((f = fopen("/sys/module/firmware_class/parameters/path", "r")) != NULL) {
+        if (fgets(custom, sizeof(custom), f) != NULL) {
+            custom[strcspn(custom, "\n")] = 0;
+
+            if (custom[0] == '/' && strlen(custom) < CF_FIRMWARE_PATH_LEN &&
+                    strstr(custom, "..") == NULL)
+                snprintf(dirs[n++], CF_FIRMWARE_PATH_LEN, "%s", custom);
+        }
+
+        fclose(f);
+    }
+
+    if (release)
+        snprintf(dirs[n++], CF_FIRMWARE_PATH_LEN, "/lib/firmware/updates/%s", un.release);
+    snprintf(dirs[n++], CF_FIRMWARE_PATH_LEN, "/lib/firmware/updates");
+    if (release)
+        snprintf(dirs[n++], CF_FIRMWARE_PATH_LEN, "/lib/firmware/%s", un.release);
+    snprintf(dirs[n++], CF_FIRMWARE_PATH_LEN, "/lib/firmware");
+
+    return n;
+#else
+    (void) dirs;
+    return 0;
+#endif
+}
+
 int cf_parse_interface(char **ret_interface, char *definition) {
     char *colonpos;
 
@@ -196,6 +241,13 @@ int cf_find_flag(char **ret_value, const char *flag, char *definition) {
             if (quote != NULL) {
                 if ((comma != NULL && quote < comma) || comma == NULL) {
                     equote = strstr(quote + 1, "\"");
+
+                    /* unterminated quote */
+                    if (equote == NULL) {
+                        *ret_value = NULL;
+                        return -1;
+                    }
+
                     *ret_value = quote + 1;
                     return (equote - (quote + 1));
                 } else {
@@ -225,6 +277,11 @@ int cf_find_flag(char **ret_value, const char *flag, char *definition) {
             if ((comma != NULL && quote < comma) || comma == NULL) {
                 /* Jump to the end of the quote */
                 equote = strstr(quote + 1, "\"");
+
+                if (equote == NULL) {
+                    *ret_value = NULL;
+                    return -1;
+                }
 
                 /* Find a trailing comma */
                 comma = strstr(equote, ",");
@@ -394,6 +451,7 @@ kis_capture_handler_t *cf_handler_init(const char *in_type) {
     ch->remote_port = 0;
 
     ch->use_tcp = 0;
+    ch->remote_rx_valid = 0;
     ch->use_ipc = 0;
     ch->use_ws = 0;
 
@@ -1432,8 +1490,23 @@ int cf_handler_launch_capture_thread(kis_capture_handler_t *caph) {
 }
 
 void cf_handler_wait_ringbuffer(kis_capture_handler_t *caph) {
-    pthread_cond_wait(&(caph->out_ringbuf_flush_cond),
-            &(caph->out_ringbuf_flush_cond_mutex));
+    /* Flushes broadcast without holding the mutex, so a wakeup can be missed; wait at
+     * most 100ms, callers retry their send after this returns */
+    struct timeval tv;
+    struct timespec ts;
+
+    gettimeofday(&tv, NULL);
+    ts.tv_sec = tv.tv_sec;
+    ts.tv_nsec = ((long) tv.tv_usec * 1000) + (100 * 1000 * 1000);
+
+    if (ts.tv_nsec >= 1000000000L) {
+        ts.tv_sec += 1;
+        ts.tv_nsec -= 1000000000L;
+    }
+
+    pthread_mutex_lock(&(caph->out_ringbuf_flush_cond_mutex));
+    pthread_cond_timedwait(&(caph->out_ringbuf_flush_cond),
+            &(caph->out_ringbuf_flush_cond_mutex), &ts);
     pthread_mutex_unlock(&(caph->out_ringbuf_flush_cond_mutex));
 }
 
@@ -2088,6 +2161,8 @@ int cf_dispatch_rx_content(kis_capture_handler_t *caph, unsigned int cmd,
             }
             cbret = 1;
 
+            mpack_tree_destroy(&tree);
+
             goto finish;
         }
     } else {
@@ -2113,6 +2188,21 @@ finish:
     return cbret;
 }
 
+/* A --tcp connection which never got a valid frame most likely reached the web server
+ * port instead of the remote capture port */
+static int cf_tcp_wrong_port(kis_capture_handler_t *caph) {
+    if (!caph->use_tcp || caph->remote_host == NULL || caph->remote_rx_valid)
+        return 0;
+
+    fprintf(stderr,
+            "FATAL: %s:%u did not answer as a Kismet remote capture server.  With --tcp,\n"
+            "connect to the server's remote capture port (remote_capture_port, default\n"
+            "3501), not the web server port (default 2501).\n",
+            caph->remote_host, caph->remote_port);
+
+    return 1;
+}
+
 int cf_handle_rx_content(kis_capture_handler_t *caph, const uint8_t *buffer, size_t len) {
     kismet_external_frame_t *external_frame;
     kismet_external_frame_v2_t *external_frame_v2;
@@ -2133,6 +2223,9 @@ int cf_handle_rx_content(kis_capture_handler_t *caph, const uint8_t *buffer, siz
 
     /* Check the signature */
     if (ntohl(external_frame->signature) != KIS_EXTERNAL_PROTO_SIG) {
+        if (cf_tcp_wrong_port(caph))
+            return -1;
+
         fprintf(stderr,
                 "FATAL: Capture source (%s) cannot communicate with this Kismet server.\n"
                 "Capture source got an unknown protocol signature, please upgrade the\n"
@@ -2146,6 +2239,10 @@ int cf_handle_rx_content(kis_capture_handler_t *caph, const uint8_t *buffer, siz
         /* handle a legacy v2 ping packet directly; this is used for datasource
          * version discovery in the new ping handshake for v3.  respond with a
          * v3 answer. */
+        if (len < sizeof(kismet_external_frame_v2_t)) {
+            return -1;
+        }
+
         if (strncasecmp(external_frame_v2->command, "PING", 32) == 0) {
             pthread_mutex_lock(&(caph->handler_lock));
 
@@ -2171,11 +2268,15 @@ int cf_handle_rx_content(kis_capture_handler_t *caph, const uint8_t *buffer, siz
 
     packet_sz = ntohl(external_frame->data_sz);
 
-    if (len < packet_sz + sizeof(kismet_external_frame_v3_t)) {
-        fprintf(stderr, "FATAL: Capture source (%s) malforned too-small v3 packet (%lu / %lu)\n",
-                caph->capsource_type, len, packet_sz + sizeof(kismet_external_frame_v3_t));
+    /* Compare without adding to packet_sz, which can wrap on 32-bit */
+    if (len < sizeof(kismet_external_frame_v3_t) ||
+            len - sizeof(kismet_external_frame_v3_t) < packet_sz) {
+        fprintf(stderr, "FATAL: Capture source (%s) malforned too-small v3 packet (%lu / %u)\n",
+                caph->capsource_type, len, packet_sz);
         return -1;
     }
+
+    caph->remote_rx_valid = 1;
 
     return cf_dispatch_rx_content(caph, ntohs(external_frame_v3->pkt_type),
             ntohl(external_frame_v3->seqno), external_frame_v3->data, packet_sz);
@@ -2218,6 +2319,9 @@ int cf_handle_rb_rx_data(kis_capture_handler_t *caph) {
 
     /* Check the signature */
     if (ntohl(external_frame->signature) != KIS_EXTERNAL_PROTO_SIG) {
+        if (cf_tcp_wrong_port(caph))
+            return -1;
+
         fprintf(stderr, "FATAL: Capture source (%s) invalid frame header received\n",
 				caph->capsource_type);
         return -1;
@@ -2226,8 +2330,24 @@ int cf_handle_rb_rx_data(kis_capture_handler_t *caph) {
     /* Detect v2 and unknown (presumably v0 using the old checksum) frames */
     if (ntohs(external_frame_v2->v2_sentinel) == KIS_EXTERNAL_V2_SIG) {
         /* explicitly handle a v2 ping no matter what; this is used as a legacy
-         * discovery packet to map older local binaries */
+         * discovery packet to map older local binaries
+         *
+         * re-peek a v2 sized header
+         */
+
+        kis_simple_ringbuf_peek_free(caph->in_ringbuf, frame_buf);
+
+        if (kis_simple_ringbuf_peek_zc(caph->in_ringbuf, (void **) &frame_buf,
+                    sizeof(kismet_external_frame_v2_t)) != sizeof(kismet_external_frame_v2_t)) {
+            return 0;
+        }
+
+        external_frame = (kismet_external_frame_t *) frame_buf;
+        external_frame_v2 = (kismet_external_frame_v2_t *) frame_buf;
+
         if (strncasecmp(external_frame_v2->command, "PING", 32) == 0) {
+            uint32_t seqno = ntohl(external_frame_v2->seqno);
+
             packet_sz = ntohl(external_frame->data_sz);
             total_sz = packet_sz + sizeof(kismet_external_frame_v2_t);
             pthread_mutex_lock(&(caph->handler_lock));
@@ -2235,7 +2355,7 @@ int cf_handle_rb_rx_data(kis_capture_handler_t *caph) {
             kis_simple_ringbuf_peek_free(caph->in_ringbuf, frame_buf);
             kis_simple_ringbuf_read(caph->in_ringbuf, NULL, total_sz);
 
-            cf_send_pong(caph, ntohl(external_frame_v2->seqno));
+            cf_send_pong(caph, seqno);
             pthread_mutex_unlock(&(caph->handler_lock));
             return 1;
         }
@@ -2256,14 +2376,16 @@ int cf_handle_rb_rx_data(kis_capture_handler_t *caph) {
     }
 
     packet_sz = ntohl(external_frame->data_sz);
-    total_sz = packet_sz + sizeof(kismet_external_frame_v3_t);
 
-    if (total_sz >= kis_simple_ringbuf_size(caph->in_ringbuf)) {
+    /* Bound packet_sz before adding the header so total_sz can't wrap */
+    if (packet_sz >= kis_simple_ringbuf_size(caph->in_ringbuf) - sizeof(kismet_external_frame_v3_t)) {
         kis_simple_ringbuf_peek_free(caph->in_ringbuf, frame_buf);
         fprintf(stderr, "FATAL: Capture source (%s) incoming packet too large for ringbuf (%u / %lu)\n",
-				caph->capsource_type, total_sz, kis_simple_ringbuf_size(caph->in_ringbuf));
+				caph->capsource_type, packet_sz, kis_simple_ringbuf_size(caph->in_ringbuf));
         return -1;
     }
+
+    total_sz = packet_sz + sizeof(kismet_external_frame_v3_t);
 
     if (rb_available < total_sz) {
         kis_simple_ringbuf_peek_free(caph->in_ringbuf, frame_buf);
@@ -2279,7 +2401,7 @@ int cf_handle_rb_rx_data(kis_capture_handler_t *caph) {
     if (kis_simple_ringbuf_peek_zc(caph->in_ringbuf, (void **) &frame_buf, total_sz) != total_sz) {
         fprintf(stderr, "FATAL: Capture source (%s) failed to read packet from ringbuf\n",
 				caph->capsource_type);
-        free(frame_buf);
+        kis_simple_ringbuf_peek_free(caph->in_ringbuf, frame_buf);
         return -1;
     }
 
@@ -2293,11 +2415,82 @@ int cf_handle_rb_rx_data(kis_capture_handler_t *caph) {
     return cbret;
 }
 
+/* Connect to the first of the remote host's addresses which answers, in resolver order,
+ * so a name with both IPv6 and IPv4 addresses reaches a server listening on only one.
+ * Returns a connected non-blocking socket and, if addr is set, the numeric address used */
+static int cf_connect_remote_host(kis_capture_handler_t *caph, char *addr, size_t addr_len,
+        char *errstr, size_t errstr_len) {
+    struct addrinfo hints, *res, *ai;
+    char port[8];
+    int fd = -1;
+    int err = ECONNREFUSED;
+    int r;
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    snprintf(port, sizeof(port), "%u", caph->remote_port);
+
+    if ((r = getaddrinfo(caph->remote_host, port, &hints, &res)) != 0) {
+        snprintf(errstr, errstr_len, "could not resolve hostname: %s", gai_strerror(r));
+        return -1;
+    }
+
+    for (ai = res; ai != NULL; ai = ai->ai_next) {
+        struct pollfd pfd;
+        socklen_t err_len = sizeof(err);
+
+        if ((fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol)) < 0) {
+            err = errno;
+            continue;
+        }
+
+        fcntl(fd, F_SETFD, fcntl(fd, F_GETFD, 0) | FD_CLOEXEC);
+        fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+
+        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0)
+            break;
+
+        if (errno == EINPROGRESS) {
+            pfd.fd = fd;
+            pfd.events = POLLOUT;
+            pfd.revents = 0;
+
+            r = poll(&pfd, 1, 5000);
+
+            if (r == 1) {
+                if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &err_len) < 0)
+                    err = errno;
+                else if (err == 0)
+                    break;
+            } else {
+                err = r == 0 ? ETIMEDOUT : errno;
+            }
+        } else {
+            err = errno;
+        }
+
+        close(fd);
+        fd = -1;
+    }
+
+    if (fd < 0) {
+        snprintf(errstr, errstr_len, "%s", strerror(err));
+    } else if (addr != NULL &&
+            getnameinfo(ai->ai_addr, ai->ai_addrlen, addr, addr_len, NULL, 0, NI_NUMERICHOST) != 0) {
+        snprintf(errstr, errstr_len, "could not format the address of '%s'", caph->remote_host);
+        close(fd);
+        fd = -1;
+    }
+
+    freeaddrinfo(res);
+
+    return fd;
+}
+
 int cf_handler_tcp_remote_connect(kis_capture_handler_t *caph) {
-    struct hostent *connect_host;
-    struct sockaddr_in client_sock, local_sock;
     int client_fd;
-    int sock_flags;
 
     char msgstr[STATUS_MAX];
 
@@ -2348,7 +2541,7 @@ int cf_handler_tcp_remote_connect(kis_capture_handler_t *caph) {
     cps = NULL;
 
     if (caph->probe_cb == NULL) {
-        fprintf(stderr, "FATAL: Unable to connect as remote source when no probe callback provided.\n");
+        fprintf(stderr, "FATAL: Unable to act as a remote source when no probe callback provided.\n");
         return -1;
     }
 
@@ -2370,69 +2563,18 @@ int cf_handler_tcp_remote_connect(kis_capture_handler_t *caph) {
         return -1;
     }
 
-    if ((connect_host = gethostbyname(caph->remote_host)) == NULL) {
-        fprintf(stderr, "FATAL: Could not resolve hostname for remote connection to '%s'\n",
-                caph->remote_host);
-
-        if (uuid)
-            free(uuid);
-
-        return -1;
-    }
-
-    memset(&client_sock, 0, sizeof(client_sock));
-    client_sock.sin_family = connect_host->h_addrtype;
-    memcpy((char *) &(client_sock.sin_addr.s_addr), connect_host->h_addr_list[0],
-            connect_host->h_length);
-    client_sock.sin_port = htons(caph->remote_port);
-
-    if ((client_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+    if ((client_fd = cf_connect_remote_host(caph, NULL, 0, msgstr, sizeof(msgstr))) < 0) {
         fprintf(stderr, "FATAL: Could not connect to remote host '%s:%u': %s\n",
-                caph->remote_host, caph->remote_port, strerror(errno));
+                caph->remote_host, caph->remote_port, msgstr);
 
         if (uuid)
             free(uuid);
 
         return -1;
-    }
-
-    sock_flags = fcntl(client_fd, F_GETFL, 0);
-    fcntl(client_fd, F_SETFL, sock_flags | O_NONBLOCK);
-
-    sock_flags = fcntl(client_fd, F_GETFD, 0);
-    fcntl(client_fd, F_SETFD, sock_flags | FD_CLOEXEC);
-
-    memset(&local_sock, 0, sizeof(local_sock));
-    local_sock.sin_family = AF_INET;
-    local_sock.sin_addr.s_addr = htonl(INADDR_ANY);
-    local_sock.sin_port = htons(0);
-
-    if (bind(client_fd, (struct sockaddr *) &local_sock, sizeof(local_sock)) < 0) {
-        fprintf(stderr, "FATAL: Could not connect to remote host '%s:%u': %s\n",
-                caph->remote_host, caph->remote_port, strerror(errno));
-        close(client_fd);
-
-        if (uuid)
-            free(uuid);
-
-        return -1;
-    }
-
-    if (connect(client_fd, (struct sockaddr *) &client_sock, sizeof(client_sock)) < 0) {
-        if (errno != EINPROGRESS) {
-            fprintf(stderr, "FATAL: Could not connect to remote host '%s:%u': %s\n",
-                    caph->remote_host, caph->remote_port, strerror(errno));
-
-            close(client_fd);
-
-            if (uuid)
-                free(uuid);
-
-            return -1;
-        }
     }
 
     caph->tcp_fd = client_fd;
+    caph->remote_rx_valid = 0;
 
     fprintf(stderr, "INFO: Connected to '%s:%u'...\n", caph->remote_host, caph->remote_port);
 
@@ -2460,6 +2602,7 @@ int cf_handler_tcp_remote_connect(kis_capture_handler_t *caph) {
 void ws_connect_attempt(kis_capture_handler_t *caph) {
     char msgstr[STATUS_MAX];
     int cbret;
+    int fd;
     cf_params_interface_t *cpi;
     cf_params_spectrum_t *cps;
 
@@ -2500,13 +2643,24 @@ void ws_connect_attempt(kis_capture_handler_t *caph) {
         return;
     }
 
+    /* libwebsockets only tries the first address of a name, so find the one which answers */
+    if ((fd = cf_connect_remote_host(caph, caph->lwsaddress, sizeof(caph->lwsaddress),
+                    msgstr, sizeof(msgstr))) < 0) {
+        fprintf(stderr, "FATAL: Could not connect to remote host '%s:%u': %s\n",
+                caph->remote_host, caph->remote_port, msgstr);
+        caph->spindown = 1;
+        return;
+    }
+
+    close(fd);
+
     memset(&caph->lwsci, 0, sizeof(struct lws_client_connect_info));
     caph->lwsci.context = caph->lwscontext;
     caph->lwsci.port = caph->remote_port;
-    caph->lwsci.address = caph->remote_host;
+    caph->lwsci.address = caph->lwsaddress;
     caph->lwsci.path = caph->lwsuri;
-    caph->lwsci.host = caph->lwsci.address;
-    caph->lwsci.origin  = caph->lwsci.address;
+    caph->lwsci.host = caph->remote_host;
+    caph->lwsci.origin  = caph->remote_host;
     caph->lwsci.ssl_connection = 0;
 
     if (caph->lwsusessl) {
@@ -2556,7 +2710,8 @@ int ws_remotecap_broker(struct lws *wsi, enum lws_callback_reasons reason,
             caph->shutdown = 1;
             pthread_mutex_unlock(&caph->handler_lock);
 
-            fprintf(stderr, "FATAL: Datasource could not connect websocket client\n");
+            fprintf(stderr, "FATAL: Datasource could not connect websocket client: %s\n",
+                    in != NULL ? (const char *) in : "unknown error");
             lws_cancel_service(caph->lwscontext);
             break;
         case LWS_CALLBACK_CLIENT_ESTABLISHED:
@@ -2946,7 +3101,8 @@ int cf_handler_loop(kis_capture_handler_t *caph) {
                     }
 
                     if (amt_read == 0) {
-                        fprintf(stderr, "FATAL: Remote side closed read pipe\n");
+                        if (!cf_tcp_wrong_port(caph))
+                            fprintf(stderr, "FATAL: Remote side closed read pipe\n");
                         rv = -1;
                         goto cap_loop_fail;
                     } else if (amt_read < 0) {
@@ -5114,13 +5270,20 @@ int cf_wait_announcement(kis_capture_handler_t *caph) {
     struct sockaddr_in lsin;
     int sock;
 
-	int r;
+	ssize_t r;
 	struct msghdr rcv_msg;
 	struct iovec iov;
 	kismet_remote_announce announcement;
 	struct sockaddr_in recv_addr;
 
     char *name;
+
+    if (caph->remote_host != NULL) {
+        free(caph->remote_host);
+        caph->remote_host = NULL;
+    }
+
+    caph->remote_port = 0;
 
     memset(&lsin, 0, sizeof(struct sockaddr_in));
     lsin.sin_family = AF_INET;
@@ -5159,8 +5322,15 @@ int cf_wait_announcement(kis_capture_handler_t *caph) {
 			return -1;
         }
 
-        if (be64toh(announcement.tag) != REMOTE_ANNOUNCE_TAG)
+        if (r < sizeof(kismet_remote_announce)) {
+            fprintf(stderr, "ERROR:  Received short announcement, ignoring.\n");
+            continue;
+        }
+
+        if (be64toh(announcement.tag) != REMOTE_ANNOUNCE_TAG) {
             fprintf(stderr, "WARNING:  Corrupt/invalid announcement seen, ignoring.\n");
+            continue;
+        }
 
         if (caph->announced_uuid != NULL)
             if (strncmp(caph->announced_uuid, announcement.uuid, 36) != 0)

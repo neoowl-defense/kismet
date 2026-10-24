@@ -164,7 +164,7 @@ kismet_ui.AddDeviceDetail("adsb", "ADSB (SDR)", 0, {
                 filterOnZero: true,
                 filterOnEmpty: true,
                 draw: function(opts) {
-                    return '<a href="https://flightaware.com/live/flight/' + opts['value'] + '" target="_new">Track ' + opts['value'] + ' on FlightAware</a>';
+                    return '<a href="https://www.flightaware.com/live/flight/' + opts['value'] + '" target="_new">Track ' + opts['value'] + ' on FlightAware</a>';
                 },
             },
             {
@@ -238,7 +238,7 @@ kismet_ui.AddDeviceDetail("adsb", "ADSB (SDR)", 0, {
                 filterOnEmpty: true,
                 draw: function(opts) {
                     try {
-                        return opts['data']['adsb.device']['adsb.device.latitude'] + ', ' + opts['data']['adsb.device']['adsb.device.longitude'] + ' <a target="_new" href="https://openstreetmap.org/?&mlat=' + opts['data']['adsb.device']['adsb.device.latitude'] + '&mlon=' + opts['data']['adsb.device']['adsb.device.longitude'] + '">View on OpenStreetMap</a>';
+                        return opts['data']['adsb.device']['adsb.device.latitude'] + ', ' + opts['data']['adsb.device']['adsb.device.longitude'] + ' <a target="_new" href="https://www.openstreetmap.org/?&mlat=' + opts['data']['adsb.device']['adsb.device.latitude'] + '&mlon=' + opts['data']['adsb.device']['adsb.device.longitude'] + '">View on OpenStreetMap</a>';
                     } catch (error) {
                         return 'n/a'
                     }
@@ -331,7 +331,7 @@ function BuildContentElement(element) {
 function ActivateTab() {
     $('#adsb_holder').ready(() => {
         if (kismet.getStorage('kismet.base.unit.distance') === 'metric' ||
-            kismet.getStorage('kismet.base.unit.distance') === '')
+            kismet.getStorage('kismet.base.unit.distance', '') === '')
             units = 'm';
 
         if (units === 'm') {
@@ -493,9 +493,9 @@ function map_cb(d) {
             loadingControl: true
         });
         map.fitBounds([[lat1, lon1], [lat2, lon2]])
-        L.tileLayer('http://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
             maxZoom: 19,
-            attribution: '&copy; <a href="http://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
             className: 'map-tiles',
         }).addTo(map);
 
@@ -506,19 +506,25 @@ function map_cb(d) {
 
     for (var d = 0; d < data['kismet.adsb.map.devices'].length; d++) {
         try {
-            if (!('kismet.device.base.location' in data['kismet.adsb.map.devices'][d])) {
+            // Plot where the aircraft says it is; its device location is where
+            // Kismet heard it, so aircraft that haven't sent a position yet
+            // aren't drawn
+            var mapdev = data['kismet.adsb.map.devices'][d];
+            var adsbloc = mapdev['kismet.device.base.reported_location'];
+
+            if (adsbloc === undefined || adsbloc === 0) {
                 continue;
             }
 
-            if (!('kismet.common.location.last' in data['kismet.adsb.map.devices'][d]['kismet.device.base.location'])) {
+            if (!('kismet.common.location.last' in adsbloc)) {
                 continue;
             }
 
-            var lat = data['kismet.adsb.map.devices'][d]['kismet.device.base.location']['kismet.common.location.last']['kismet.common.location.geopoint'][1];
-            var lon = data['kismet.adsb.map.devices'][d]['kismet.device.base.location']['kismet.common.location.last']['kismet.common.location.geopoint'][0];
-            var heading = data['kismet.adsb.map.devices'][d]['kismet.device.base.location']['kismet.common.location.last']['kismet.common.location.heading'];
-            var altitude = data['kismet.adsb.map.devices'][d]['kismet.device.base.location']['kismet.common.location.last']['kismet.common.location.alt'];
-            var speed = data['kismet.adsb.map.devices'][d]['kismet.device.base.location']['kismet.common.location.last']['kismet.common.location.speed'];
+            var lat = adsbloc['kismet.common.location.last']['kismet.common.location.geopoint'][1];
+            var lon = adsbloc['kismet.common.location.last']['kismet.common.location.geopoint'][0];
+            var heading = adsbloc['kismet.common.location.last']['kismet.common.location.heading'];
+            var altitude = adsbloc['kismet.common.location.last']['kismet.common.location.alt'];
+            var speed = adsbloc['kismet.common.location.last']['kismet.common.location.speed'];
             var icao = data['kismet.adsb.map.devices'][d]['adsb.device']['adsb.device.icao'];
             var id = data['kismet.adsb.map.devices'][d]['adsb.device']['kismet.adsb.icao_record']['adsb.icao.regid'];
             var packets = data['kismet.adsb.map.devices'][d]['kismet.device.base.packets.data'];
@@ -670,7 +676,7 @@ function map_cb(d) {
 
             // Assign the historic path, if location history is available
             try {
-                var history = data['kismet.adsb.map.devices'][d]['kismet.device.base.location_cloud']['kis.gps.rrd.samples_100'];
+                var history = mapdev['kismet.device.base.reported_location_cloud']['kis.gps.rrd.samples_100'];
 
                 for (var s in history) {
                     // Ignore non-location historic points (caused by heading/altitude before we got

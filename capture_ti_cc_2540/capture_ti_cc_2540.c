@@ -200,6 +200,7 @@ int probe_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition
 
     /* Look for the interface type */
     if (strstr(interface, "ticc2540") != interface) {
+        snprintf(msg, STATUS_MAX, "Expected ticc2540 interface, skipping");
         free(interface);
         return 0;
     }
@@ -220,13 +221,24 @@ int probe_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition
 
     /* If we don't have a valid busno/devno or malformed interface name */
     if (busno == -1 && devno == -1) {
+        snprintf(msg, STATUS_MAX, "Invalid ticc2540 interface, expected ticc2540-# or ticc2540-bus#-dev#");
         return 0;
     }
 
     pthread_mutex_lock(&(localticc2540->usb_mutex));
+
+    if (localticc2540->libusb_ctx == NULL) {
+        x = libusb_init(&localticc2540->libusb_ctx);
+        if (x < 0) {
+            snprintf(msg, STATUS_MAX, "Could not initialize libusb");
+            return 0;
+        }
+    }
+
     libusb_devices_cnt = libusb_get_device_list(localticc2540->libusb_ctx, &libusb_devs);
 
     if (libusb_devices_cnt < 0) {
+        snprintf(msg, STATUS_MAX, "Could not find any USB devices");
         return 0;
     }
 
@@ -262,6 +274,7 @@ int probe_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition
     pthread_mutex_unlock(&(localticc2540->usb_mutex));
 
     if (!matched_device) {
+        snprintf(msg, STATUS_MAX, "Did not find any matching ticc2540 interfaces");
         return 0;
     }
 
@@ -307,6 +320,16 @@ int list_callback(kis_capture_handler_t *caph, uint32_t seqno, char *msg,
 
     local_ticc2540_t *localticc2540 = (local_ticc2540_t *) caph->userdata;
     pthread_mutex_lock(&(localticc2540->usb_mutex));
+
+    if (localticc2540->libusb_ctx == NULL) {
+        r = libusb_init(&localticc2540->libusb_ctx);
+        if (r < 0) {
+            snprintf(msg, STATUS_MAX, "Could not initialize libusb");
+            pthread_mutex_unlock(&(localticc2540->usb_mutex));
+            return 0;
+        }
+    }
+
     libusb_devices_cnt = libusb_get_device_list(localticc2540->libusb_ctx, &libusb_devs);
     pthread_mutex_unlock(&(localticc2540->usb_mutex));
 
@@ -532,15 +555,23 @@ int open_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition,
     }
 
     pthread_mutex_lock(&(localticc2540->usb_mutex));
+    if (localticc2540->libusb_ctx == NULL) {
+        x = libusb_init(&localticc2540->libusb_ctx);
+        if (x < 0) {
+            snprintf(msg, STATUS_MAX, "Could not initialize libusb");
+            pthread_mutex_unlock(&localticc2540->usb_mutex);
+            return -1;
+        }
+    }
+
     libusb_devices_cnt = libusb_get_device_list(localticc2540->libusb_ctx, &libusb_devs);
-    pthread_mutex_unlock(&(localticc2540->usb_mutex));
 
     if (libusb_devices_cnt < 0) {
         snprintf(msg, STATUS_MAX, "Unable to iterate USB devices"); 
+        pthread_mutex_unlock(&(localticc2540->usb_mutex));
         return -1;
     }
     
-    pthread_mutex_lock(&(localticc2540->usb_mutex));
     for (i = 0; i < libusb_devices_cnt; i++) {
         struct libusb_device_descriptor dev;
 
@@ -796,11 +827,6 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
-    r = libusb_init(&localticc2540.libusb_ctx);
-    if (r < 0) {
-        return -1;
-    }
-
     localticc2540.caph = caph;
 
     /* Set the local data ptr */
@@ -843,8 +869,9 @@ int main(int argc, char *argv[]) {
 
     cf_handler_shutdown(caph);
 
-    libusb_exit(localticc2540.libusb_ctx);
-    
+    if (localticc2540.libusb_ctx != NULL)
+        libusb_exit(localticc2540.libusb_ctx);
+
     return 0;
 }
 

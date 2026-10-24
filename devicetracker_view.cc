@@ -30,6 +30,8 @@
 #include "kis_mutex.h"
 #include "kismet_algorithm.h"
 
+std::atomic<unsigned int> device_tracker_view::next_view_index{0};
+
 device_tracker_view::device_tracker_view(const std::string& in_id, const std::string& in_description,
         new_device_cb in_new_cb, updated_device_cb in_update_cb) :
     tracker_component{},
@@ -45,6 +47,8 @@ device_tracker_view::device_tracker_view(const std::string& in_id, const std::st
     view_description->set(in_description);
     view_indexed->set(true);
 
+    view_mutex.set_name("device_tracker_view");
+    view_index = next_view_index.fetch_add(1);
     device_list = std::make_shared<tracker_element_vector>();
 
     register_urls(in_id);
@@ -66,6 +70,8 @@ device_tracker_view::device_tracker_view(const std::string& in_id, const std::st
     view_description->set(in_description);
     view_indexed->set(true);
 
+    view_mutex.set_name("device_tracker_view");
+    view_index = next_view_index.fetch_add(1);
     device_list = std::make_shared<tracker_element_vector>();
 
     register_urls(in_id);
@@ -89,14 +95,21 @@ void device_tracker_view::register_urls(const std::string& in_id) {
             std::make_shared<kis_net_web_function_endpoint>(
                 [this](std::shared_ptr<kis_net_beast_httpd_connection> con) {
                     return device_endpoint_handler(con);
-                }, devicetracker->get_devicelist_mutex()));
+                }));
 
     uri = fmt::format("/devices/views/{}/last-time/:timestamp/devices", in_id);
     httpd->register_route(uri, {"GET", "POST"}, httpd->RO_ROLE, {},
             std::make_shared<kis_net_web_tracked_endpoint>(
                 [this](std::shared_ptr<kis_net_beast_httpd_connection> con) {
-                    return device_time_endpoint(con);
-                }, devicetracker->get_devicelist_mutex()));
+                    return device_time_endpoint(con, false);
+                }));
+
+    uri = fmt::format("/devices/views/{}/modified-since/:timestamp/devices", in_id);
+    httpd->register_route(uri, {"GET", "POST"}, httpd->RO_ROLE, {},
+            std::make_shared<kis_net_web_tracked_endpoint>(
+                [this](std::shared_ptr<kis_net_beast_httpd_connection> con) {
+                    return device_time_endpoint(con, true);
+                }));
 
     uri = fmt::format("/devices/views/{}/monitor", in_id);
     httpd->register_websocket_route(uri, httpd->RO_ROLE, {"ws"},
@@ -155,16 +168,16 @@ void device_tracker_view::register_urls(const std::string& in_id) {
 
                                 auto rename_map = Globalreg::new_from_pool<tracker_element_serializer::rename_map>();
 
-                                time_t last_tm = 0;
+                                auto last_tm = std::make_shared<time_t>(0);
 
                                 // Generate a timer event that goes and looks for the devices and
                                 // serializes them with the fields record
                                 auto tid =
                                     timetracker->register_timer(std::chrono::seconds(rate), true,
-                                            [this, con, dev_r, dev_k, dev_m, json, ws, &last_tm, rename_map, format_t](int) -> int {
+                                            [this, con, dev_r, dev_k, dev_m, json, ws, last_tm, rename_map, format_t](int) -> int {
                                                 if (dev_r == "*") {
                                                     auto worker = device_tracker_view_function_worker([json, last_tm, format_t, ws](std::shared_ptr<kis_tracked_device_base> dev) -> bool {
-                                                        if (dev->get_mod_time() > last_tm) {
+                                                        if (dev->get_mod_time() > *last_tm) {
                                                             std::stringstream ss;
                                                             Globalreg::globalreg->entrytracker->serialize_with_json_summary(format_t, ss, dev, json);
                                                             ws->write(ss.str());
@@ -179,7 +192,7 @@ void device_tracker_view::register_urls(const std::string& in_id) {
 
                                                     auto dev = fetch_device(dev_k);
                                                     if (dev != nullptr) {
-                                                        if (dev->get_mod_time() > last_tm) {
+                                                        if (dev->get_mod_time() > *last_tm) {
                                                             std::stringstream ss;
                                                             Globalreg::globalreg->entrytracker->serialize_with_json_summary(format_t, ss, dev, json);
                                                             ws->write(ss.str());
@@ -191,11 +204,14 @@ void device_tracker_view::register_urls(const std::string& in_id) {
                                                     auto mvec = devicetracker->fetch_devices(dev_m);
 
                                                     for (const auto& i : mvec) {
-                                                        auto pk = device_presence_map.find(i->get_key());
-                                                        if (pk == device_presence_map.end() || pk->second == false)
-                                                            continue;
+                                                        {
+                                                            kis_view_lock vlk(view_mutex, true);
+                                                            auto pk = device_presence_map.find(i->get_key());
+                                                            if (pk == device_presence_map.end() || pk->second == false)
+                                                                continue;
+                                                        }
 
-                                                        if (i->get_mod_time() > last_tm) {
+                                                        if (i->get_mod_time() > *last_tm) {
                                                             std::stringstream ss;
                                                             Globalreg::globalreg->entrytracker->serialize_with_json_summary(format_t, ss, i, json);
                                                             ws->write(ss.str());
@@ -203,7 +219,7 @@ void device_tracker_view::register_urls(const std::string& in_id) {
                                                     }
                                                 }
 
-                                                last_tm = time(0);
+                                                *last_tm = time(0);
 
                                                 return 1;
                                             });
@@ -232,19 +248,23 @@ void device_tracker_view::register_urls(const std::string& in_id) {
                 }));
 }
 
+// Serializing a view writes only its own fields (the device list isn't a field), so the
+// view's lock is enough; held across the serialization, released in post_serialize
 void device_tracker_view::pre_serialize() {
-    kis_lock_guard<kis_mutex> lk(devicetracker->get_devicelist_mutex(), kismet::retain_lock, "devicetracker_view serialize");
+    view_mutex.lock_shared();
+    kis_view_locks_held++;
 }
 
 void device_tracker_view::post_serialize() {
-    kis_lock_guard<kis_mutex> lk(devicetracker->get_devicelist_mutex(), std::adopt_lock, "devicetracker_view post_serialize");
+    kis_view_locks_held--;
+    view_mutex.unlock_shared();
 }
 
 std::shared_ptr<tracker_element_vector> device_tracker_view::do_device_work(device_tracker_view_worker& worker) {
     // Make a copy of the vector in case the worker manipulates the original
     std::shared_ptr<tracker_element_vector> immutable_copy;
     {
-        kis_lock_guard<kis_mutex> lk(devicetracker->get_devicelist_mutex());
+        kis_view_lock vlk(view_mutex, true);
         immutable_copy = std::make_shared<tracker_element_vector>(device_list);
     }
 
@@ -255,7 +275,7 @@ std::shared_ptr<tracker_element_vector> device_tracker_view::do_readonly_device_
     // Make a copy of the vector in case the worker manipulates the original
     std::shared_ptr<tracker_element_vector> immutable_copy;
     {
-        kis_lock_guard<kis_mutex> lk(devicetracker->get_devicelist_mutex());
+        kis_view_lock vlk(view_mutex, true);
         immutable_copy = std::make_shared<tracker_element_vector>(device_list);
     }
 
@@ -267,10 +287,8 @@ std::shared_ptr<tracker_element_vector> device_tracker_view::do_device_work(devi
     auto ret = std::make_shared<tracker_element_vector>();
     ret->reserve(devices->size());
 
-    // Lock the whole device list for the duration; we may already hold this lock if we're inside the webserver
-    // but that's OK
-    kis_lock_guard<kis_mutex> dev_lg(devicetracker->get_devicelist_mutex(),
-            "device_tracker_view do_device_work");
+    // Each device is locked as it's worked on; devices from phys without device locking
+    // take the device list lock for just that device
 
     std::for_each(devices->begin(), devices->end(),
             [&](shared_tracker_element val) {
@@ -281,7 +299,11 @@ std::shared_ptr<tracker_element_vector> device_tracker_view::do_device_work(devi
             auto dev = std::static_pointer_cast<kis_tracked_device_base>(val);
 
             bool m;
-            m = worker.match_device(dev);
+
+            {
+                kis_device_lock dlk(dev, false);
+                m = worker.match_device(dev);
+            }
 
             if (m)
                 ret->push_back(dev);
@@ -297,18 +319,11 @@ std::shared_ptr<tracker_element_vector> device_tracker_view::do_device_work(devi
 
 std::shared_ptr<tracker_element_vector> device_tracker_view::do_readonly_device_work(device_tracker_view_worker& worker,
         std::shared_ptr<tracker_element_vector> devices) {
-
-    // read-only workers are currently disabled because it may not be reasonable to solve conflicts
-    // at the per-device level, use the locked worker.
-
-    return do_device_work(worker, devices);
-
-#if 0
     auto ret = std::make_shared<tracker_element_vector>();
     ret->reserve(devices->size());
 
-    kis_lock_guard<kis_mutex> ul_devlist(devicetracker->get_devicelist_mutex(),
-            "device_tracker_view do_readonly_device_work");
+    // Each device is locked as it's read; devices from phys without device locking take
+    // the device list lock for just that device
 
     std::for_each(devices->begin(), devices->end(),
             [&](shared_tracker_element val) {
@@ -318,7 +333,12 @@ std::shared_ptr<tracker_element_vector> device_tracker_view::do_readonly_device_
 
             auto dev = std::static_pointer_cast<kis_tracked_device_base>(val);
 
-            auto m = worker.match_device(dev);
+            bool m;
+
+            {
+                kis_device_lock dlk(dev, true);
+                m = worker.match_device(dev);
+            }
 
             if (m)
                 ret->push_back(dev);
@@ -330,34 +350,57 @@ std::shared_ptr<tracker_element_vector> device_tracker_view::do_readonly_device_
     worker.finalize();
 
     return ret;
-#endif
 }
 
 std::shared_ptr<kis_tracked_device_base> device_tracker_view::fetch_device(device_key in_key) {
-    kis_lock_guard<kis_mutex> lk(devicetracker->get_devicelist_mutex(), "device_tracker_view fetch_device");
+    {
+        kis_view_lock vlk(view_mutex, true);
 
-    auto present_itr = device_presence_map.find(in_key);
+        auto present_itr = device_presence_map.find(in_key);
 
-    if (present_itr == device_presence_map.end() || present_itr->second == false)
-        return nullptr;
+        if (present_itr == device_presence_map.end() || present_itr->second == false)
+            return nullptr;
+    }
 
+    // The device list is locked before views, so look it up after releasing the view
     return devicetracker->fetch_device(in_key);
+}
+
+void device_tracker_view::set_present(const std::shared_ptr<kis_tracked_device_base>& device, bool present) {
+    auto dpmi = device_presence_map.find(device->get_key());
+
+    if (present && dpmi == device_presence_map.end()) {
+        device_presence_map[device->get_key()] = true;
+        device_list->push_back(device);
+    } else if (!present && dpmi != device_presence_map.end()) {
+        // Removing from the vector is expensive, but rare
+        device_presence_map.erase(dpmi);
+
+        for (auto vi = device_list->begin(); vi != device_list->end(); ++vi) {
+            if (*vi == device) {
+                device_list->erase(vi);
+                break;
+            }
+        }
+    } else {
+        return;
+    }
+
+    if (tracks_membership_on_device())
+        device->set_in_view(view_index, present);
+
+    list_sz->set(device_list->size());
 }
 
 void device_tracker_view::new_device(std::shared_ptr<kis_tracked_device_base> device) {
     if (new_cb != nullptr) {
-        // Only called under guard from devicetracker
-        // kis_lock_guard<kis_mutex> lk(devicetracker->get_devicelist_mutex());
+        // Hold the device through the membership change so a concurrent update can't
+        // apply a stale filter result
+        kis_device_lock dlk(device, true);
 
         if (new_cb(device)) {
-            auto dpmi = device_presence_map.find(device->get_key());
-
-            if (dpmi == device_presence_map.end()) {
-                device_presence_map[device->get_key()] = true;
-                device_list->push_back(device);
-            }
-
-            list_sz->set(device_list->size());
+            kis_view_lock vlk(view_mutex, false);
+            set_present(device, true);
         }
     }
 }
@@ -367,92 +410,50 @@ void device_tracker_view::update_device(std::shared_ptr<kis_tracked_device_base>
     if (update_cb == nullptr)
         return;
 
-    // Only called under guard from devicetracker already
-    // kis_lock_guard<kis_mutex> lk(devicetracker->get_devicelist_mutex());
+    // Hold the device through the membership change so a concurrent update can't apply
+    // a stale filter result
+    kis_device_lock dlk(device, true);
 
     bool retain = update_cb(device);
 
-    auto dpmi = device_presence_map.find(device->get_key());
+    // This runs for every view on every packet, and membership rarely changes; check the
+    // device's own record before touching the view lock
+    if (tracks_membership_on_device()) {
+        if (retain == device->in_view(view_index))
+            return;
+    } else {
+        kis_view_lock vlk(view_mutex, true);
 
-    // If we're adding the device (or keeping it) and we don't have it tracked,
-    // add it and record it in the presence map
-    if (retain && dpmi == device_presence_map.end()) {
-        device_list->push_back(device);
-        device_presence_map[device->get_key()] = true;
-        list_sz->set(device_list->size());
-        return;
+        if (retain == (device_presence_map.find(device->get_key()) != device_presence_map.end()))
+            return;
     }
 
-    // if we're removing the device, find it in the vector and remove it, and remove
-    // it from the presence map; this is expensive
-    if (!retain && dpmi != device_presence_map.end()) {
-        for (auto di = device_list->begin(); di != device_list->end(); ++di) {
-            if (*di == device) {
-                device_list->erase(di);
-                break;
-            }
-        }
-        device_presence_map.erase(dpmi);
-        list_sz->set(device_list->size());
-        return;
-    }
+    kis_view_lock vlk(view_mutex, false);
+    set_present(device, retain);
 }
 
 void device_tracker_view::remove_device(std::shared_ptr<kis_tracked_device_base> device) {
-    // Only called under guard from devicetracker
-    // kis_lock_guard<kis_mutex> lk(devicetracker->get_devicelist_mutex());
-
-    auto di = device_presence_map.find(device->get_key());
-
-    if (di != device_presence_map.end()) {
-        device_presence_map.erase(di);
-
-        for (auto vi = device_list->begin(); vi != device_list->end(); ++vi) {
-            if (*vi == device) {
-                device_list->erase(vi);
-                break;
-            }
-        }
-
-        list_sz->set(device_list->size());
-    }
+    kis_view_lock vlk(view_mutex, false);
+    set_present(device, false);
 }
 
 void device_tracker_view::add_device_direct(std::shared_ptr<kis_tracked_device_base> device) {
+    KIS_CHECK_NO_DEVICE_LOCKS("device_tracker_view add_device_direct");
     kis_lock_guard<kis_mutex> lk(devicetracker->get_devicelist_mutex());
-
-    auto di = device_presence_map.find(device->get_key());
-
-    if (di != device_presence_map.end())
-        return;
-
-    device_presence_map[device->get_key()] = true;
-    device_list->push_back(device);
-
-    list_sz->set(device_list->size());
+    kis_view_lock vlk(view_mutex, false);
+    set_present(device, true);
 }
 
 void device_tracker_view::remove_device_direct(std::shared_ptr<kis_tracked_device_base> device) {
+    KIS_CHECK_NO_DEVICE_LOCKS("device_tracker_view remove_device_direct");
     kis_lock_guard<kis_mutex> lk(devicetracker->get_devicelist_mutex());
-
-    auto di = device_presence_map.find(device->get_key());
-
-    if (di != device_presence_map.end()) {
-        device_presence_map.erase(di);
-
-        for (auto vi = device_list->begin(); vi != device_list->end(); ++vi) {
-            if (*vi == device) {
-                device_list->erase(vi);
-                break;
-            }
-        }
-
-        list_sz->set(device_list->size());
-    }
+    kis_view_lock vlk(view_mutex, false);
+    set_present(device, false);
 }
 
 std::shared_ptr<tracker_element>
-device_tracker_view::device_time_endpoint(std::shared_ptr<kis_net_beast_httpd_connection> con) {
+device_tracker_view::device_time_endpoint(std::shared_ptr<kis_net_beast_httpd_connection> con,
+        bool modified) {
     auto ret = Globalreg::new_from_pool<tracker_element_vector>();
     std::ostream os(&con->response_stream());
 
@@ -471,7 +472,8 @@ device_tracker_view::device_time_endpoint(std::shared_ptr<kis_net_beast_httpd_co
 
     auto worker =
         device_tracker_view_function_worker([&](std::shared_ptr<kis_tracked_device_base> dev) -> bool {
-                if (dev->get_last_time() < ts)
+                auto dev_ts = modified ? dev->get_mod_time() : dev->get_last_time();
+                if (dev_ts < ts)
                     return false;
 
                 return true;
@@ -617,7 +619,7 @@ void device_tracker_view::device_endpoint_handler(std::shared_ptr<kis_net_beast_
             transmit = wrapper_elem;
         }
 
-        // Handle legacy datatable otpions, if datatable=true
+        // Handle legacy datatable options, if datatable=true
         if (con->json().value("datatable", false)) {
             // Extract from the raw postvars
             auto start_k = con->http_variables().find("start");
@@ -726,7 +728,10 @@ void device_tracker_view::device_endpoint_handler(std::shared_ptr<kis_net_beast_
 
     // Copy the entire vector list, under lock, to the next work vector; this makes it an independent copy
     // we can sort and manipulate
-    next_work_vec->set(device_list->begin(), device_list->end());
+    {
+        kis_view_lock vlk(view_mutex, true);
+        next_work_vec->set(device_list->begin(), device_list->end());
+    }
     total_sz_elem->set(next_work_vec->size());
 
     // If we have a time filter, apply that first, it's the fastest.
@@ -794,17 +799,31 @@ void device_tracker_view::device_endpoint_handler(std::shared_ptr<kis_net_beast_
     // if (in_order_column_num.length() && order_field.size() > 0) {
 
     if (order_field.size() > 0) {
+        // Comparing live fields would read two unlocked devices at once; copy each device's
+        // sort key under its own lock and sort those instead
+        std::vector<std::pair<shared_tracker_element, shared_tracker_element>> keyed;
+        keyed.reserve(next_work_vec->size());
+
+        for (const auto& d : *next_work_vec) {
+            shared_tracker_element k;
+
+            {
+                kis_device_lock dlk(std::static_pointer_cast<kis_tracked_device_base>(d), true);
+                k = clone_sortable_tracker_element(get_tracker_element_path(order_field, d));
+            }
+
+            keyed.emplace_back(std::move(k), d);
+        }
+
         std::stable_sort(
 #if defined(HAVE_CPP17_PARALLEL)
             std::execution::par_unseq,
 #endif
-            next_work_vec->begin(), next_work_vec->end(),
-                [&](shared_tracker_element a, shared_tracker_element b) -> bool {
-                shared_tracker_element fa;
-                shared_tracker_element fb;
-
-                fa = get_tracker_element_path(order_field, a);
-                fb = get_tracker_element_path(order_field, b);
+            keyed.begin(), keyed.end(),
+                [&](const std::pair<shared_tracker_element, shared_tracker_element>& a,
+                    const std::pair<shared_tracker_element, shared_tracker_element>& b) -> bool {
+                const auto& fa = a.first;
+                const auto& fb = b.first;
 
                 if (fa == nullptr)
                     return in_order_direction == 0;
@@ -817,6 +836,9 @@ void device_tracker_view::device_endpoint_handler(std::shared_ptr<kis_net_beast_
 
                 return fast_sort_tracker_element_less(fb, fa);
             });
+
+        for (size_t i = 0; i < keyed.size(); i++)
+            (*next_work_vec)[i] = keyed[i].second;
     }
 
     // Summarize into the output element

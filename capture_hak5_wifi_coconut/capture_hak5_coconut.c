@@ -129,6 +129,7 @@ int probe_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition
     interface = strndup(placeholder, placeholder_len);
 
     if (strstr(interface, "coconut") != interface) {
+        snprintf(msg, STATUS_MAX, "Expected coconut interface, skipping");
         free(interface);
         return 0;
     }
@@ -138,6 +139,7 @@ int probe_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition
   
     /* Malformed somehow */
     if (ret != -1 && ret != 1) {
+        snprintf(msg, STATUS_MAX, "Could not parse coconut interface, expected coconut-#");
         return 0;
     }
 
@@ -148,8 +150,10 @@ int probe_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition
 
     free(interface);
 
-    if (ret < 0)
+    if (ret < 0) {
+        snprintf(msg, STATUS_MAX, "No coconut interfaces found");
         return 0;
+    }
 
     if ((placeholder_len = cf_find_flag(&placeholder, "uuid", definition)) > 0) {
         *uuid = strdup(placeholder);

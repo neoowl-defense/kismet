@@ -19,6 +19,9 @@
 
 #include "config.h"
 
+#include <cctype>
+#include <optional>
+
 #include "phy_adsb.h"
 #include "datasource_virtual.h"
 
@@ -28,6 +31,88 @@
 #include "kis_httpd_registry.h"
 #include "manuf.h"
 #include "messagebus.h"
+
+
+namespace {
+    // ADSB JSON records from the capture tools and the proxy
+    bool adsb_json_type(const std::string& type) {
+        return type == "adsb" || type == "RTLadsb";
+    }
+
+    // The raw message as hex: "adsb" is AVR framed (*HEX;) and "adsb_raw_msg" is bare hex
+    std::optional<std::string> adsb_json_hex(const std::string& json_string) {
+        nlohmann::json j;
+
+        try {
+            j = nlohmann::json::parse(json_string);
+        } catch (const std::exception& e) {
+            return std::nullopt;
+        }
+
+        if (!j.is_object())
+            return std::nullopt;
+
+        std::string hex;
+
+        auto a = j.find("adsb");
+        auto r = j.find("adsb_raw_msg");
+
+        if (a != j.end() && a->is_string())
+            hex = a->get<std::string>();
+        else if (r != j.end() && r->is_string())
+            hex = r->get<std::string>();
+        else
+            return std::nullopt;
+
+        auto b = hex.find_first_not_of(" \t\r\n*");
+        auto e = hex.find_last_not_of(" \t\r\n;");
+
+        if (b == std::string::npos || e == std::string::npos || e < b)
+            return std::nullopt;
+
+        hex = hex.substr(b, e - b + 1);
+
+        if (hex.size() % 2 != 0)
+            return std::nullopt;
+
+        for (const auto c : hex)
+            if (!isxdigit(static_cast<unsigned char>(c)))
+                return std::nullopt;
+
+        return hex;
+    }
+
+    // A Mode-S BEAST frame (https://wiki.jetvision.de/wiki/Mode-S_Beast:Data_Output_Formats): escape,
+    // frame type, 48 bit big endian 12MHz timestamp, signal, and the message; any 0x1a after the frame
+    // type is doubled
+    std::string adsb_beast_frame(const std::string& msg, const struct timeval& ts) {
+        std::string out;
+        out.reserve(2 + (6 + 1 + msg.size()) * 2);
+
+        out += static_cast<char>(0x1a);
+        out += msg.size() == 7 ? '2' : '3';
+
+        auto put = [&out](uint8_t c) {
+            out += static_cast<char>(c);
+            if (c == 0x1a)
+                out += static_cast<char>(c);
+        };
+
+        const uint64_t ticks =
+            (static_cast<uint64_t>(ts.tv_sec) * 1000000 + static_cast<uint64_t>(ts.tv_usec)) * 12;
+
+        for (int i = 5; i >= 0; i--)
+            put(static_cast<uint8_t>((ticks >> (i * 8)) & 0xFF));
+
+        // Signal level isn't known
+        put(0);
+
+        for (const auto c : msg)
+            put(static_cast<uint8_t>(c));
+
+        return out;
+    }
+}
 
 uint32_t kis_adsb_phy::modes_checksum_table[] = {
     0x3935ea, 0x1c9af5, 0xf1b77e, 0x78dbbf, 0xc397db, 0x9e31e9, 
@@ -69,8 +154,6 @@ kis_adsb_phy::kis_adsb_phy(int in_phyid) :
         packetchain->register_packet_component("JSON");
     pack_comp_meta =
         packetchain->register_packet_component("METABLOB");
-	pack_comp_gps =
-        packetchain->register_packet_component("GPS");
     pack_comp_datasource =
         packetchain->register_packet_component("KISDATASRC");
 
@@ -170,36 +253,47 @@ kis_adsb_phy::kis_adsb_phy(int in_phyid) :
                                             if (!text)
                                                 return;
 
-                                            if (buf->size() < 4)
-                                                return;
+                                            // One or more AVR format messages (*HEX;), one per line
+                                            const auto bufstr = boost::beast::buffers_to_string(buf->data());
 
-                                            auto bufstr = boost::beast::buffers_to_string(buf->data());
+                                            for (const auto& line : str_tokenize(bufstr, "\n")) {
+                                                const auto e = line.find_last_not_of(" \t\r");
 
-                                            if (bufstr[0] != '*') {
-                                                _MSG_DEBUG("Invalid adsb proxy {}", bufstr);
-                                                return;
+                                                if (e == std::string::npos)
+                                                    continue;
+
+                                                const auto msg = line.substr(0, e + 1);
+                                                const auto b = msg.find_first_not_of(" \t");
+
+                                                // Validated as hex before it goes into the packet JSON
+                                                bool valid = b != std::string::npos && msg.length() - b >= 4 &&
+                                                    msg[b] == '*' && msg.back() == ';' && (msg.length() - b - 2) % 2 == 0;
+
+                                                for (size_t i = b + 1; valid && i < msg.length() - 1; i++)
+                                                    if (!isxdigit(static_cast<unsigned char>(msg[i])))
+                                                        valid = false;
+
+                                                if (!valid) {
+                                                    _MSG_DEBUG("Invalid adsb proxy message {}", line);
+                                                    continue;
+                                                }
+
+                                                // Proxy input
+                                                auto packet = packetchain->generate_packet();
+                                                gettimeofday(&(packet->ts), NULL);
+
+                                                auto jsoninfo = std::make_shared<kis_json_packinfo>();
+
+                                                jsoninfo->type = "adsb";
+
+                                                jsoninfo->json_string =
+                                                    fmt::format("{{\"adsb_raw_msg\": \"{}\"}}",
+                                                            msg.substr(b + 1, msg.length() - b - 2));
+
+                                                packet->insert(pack_comp_json, jsoninfo);
+
+                                                virtual_source->handle_rx_packet(packet);
                                             }
-
-                                            if (bufstr[bufstr.length() - 2] != ';') {
-                                                _MSG_DEBUG("Invalid adsb proxy {}", bufstr);
-                                                return;
-                                            }
-
-                                            // Proxy input
-                                            auto packet = packetchain->generate_packet();
-                                            gettimeofday(&(packet->ts), NULL);
-
-                                            auto jsoninfo = std::make_shared<kis_json_packinfo>();
-
-                                            jsoninfo->type = "adsb";
-
-                                            jsoninfo->json_string = 
-                                                fmt::format("{{\"adsb_raw_msg\": \"{}\"}}",
-                                                        bufstr.substr(1, bufstr.length() - 3));
-
-                                            packet->insert(pack_comp_json, jsoninfo);
-
-                                            virtual_source->handle_rx_packet(packet);
 
                                         });
 
@@ -219,7 +313,7 @@ kis_adsb_phy::kis_adsb_phy(int in_phyid) :
             std::make_shared<kis_net_web_tracked_endpoint>(
                 [this](std::shared_ptr<kis_net_beast_httpd_connection> con) {
                     return adsb_map_endp_handler(con);
-                }, devicetracker->get_devicelist_mutex()));
+                }));
 
     httpd->register_websocket_route("/phy/ADSB/beast", {httpd->RO_ROLE, "ADSB"}, {"ws"},
             std::make_shared<kis_net_web_function_endpoint>(
@@ -255,61 +349,22 @@ kis_adsb_phy::kis_adsb_phy(int in_phyid) :
                                 if (json == NULL)
                                     return 0;
 
-                                if (json->type != "adsb")
+                                if (!adsb_json_type(json->type))
                                     return 0;
 
-                                std::stringstream ss(json->json_string);
-                                nlohmann::json device_json;
+                                auto hex = adsb_json_hex(json->json_string);
+                                if (!hex)
+                                    return 0;
 
                                 try {
-                                    ss >> device_json;
+                                    const auto adsb_content = hex_to_bytes(*hex);
 
-                                    std::string adsb_content;
-
-                                    auto hex_j = device_json["adsb"];
-
-                                    if (hex_j.is_null() || !hex_j.is_string()) {
-                                        hex_j = device_json["adsb_raw_msg"];
-                                        adsb_content = hex_to_bytes(hex_j);
-                                    } else {
-                                        const auto stradsb = hex_j.get<std::string>();
-                                        adsb_content = hex_to_bytes(stradsb.substr(1, stradsb.size() - 2));    
-                                    }
-
-
-                                    if (adsb_content.size() != 7 && adsb_content.size() != 14) {
-                                        _MSG_DEBUG("unexpected content length {}", adsb_content.size());
+                                    // BEAST frames carry Mode-S short and long messages
+                                    if (adsb_content.size() != 7 && adsb_content.size() != 14)
                                         return 0;
-                                    }
 
-                                    auto buf = new char[sizeof(adsb_beast_frame) + adsb_content.size()];
-                                    auto frame = reinterpret_cast<adsb_beast_frame_t *>(buf);
-
-                                    frame->esc = 0x1a;
-
-                                    if (adsb_content.size() == 7)
-                                        frame->frametype = '2';
-                                    else if (adsb_content.size() == 14)
-                                        frame->frametype = '3';
-
-                                    struct timeval tv;
-                                    gettimeofday(&tv, 0);
-
-                                    auto mlat_s = reinterpret_cast<uint32_t *>(&frame->mlat_ts);
-                                    auto mlat_us = reinterpret_cast<uint32_t *>(&frame->mlat_ts + 2);
-
-                                    *mlat_s = tv.tv_usec << 4;
-                                    *mlat_us = tv.tv_usec;
-
-                                    frame->signal = 0;
-
-                                    memcpy(frame->modes, adsb_content.data(), adsb_content.size());
-
-                                    uptr->ws->write(std::string(buf, sizeof(adsb_beast_frame) + adsb_content.size()));
-
-                                    delete[] buf;
-
-                                } catch (std::exception& e) {
+                                    uptr->ws->write(adsb_beast_frame(adsb_content, in_pack->ts));
+                                } catch (const std::exception& e) {
                                     return 0;
                                 }
 
@@ -364,26 +419,17 @@ kis_adsb_phy::kis_adsb_phy(int in_phyid) :
                             if (json == NULL)
                                 return 0;
 
-                            if (json->type != "adsb")
+                            if (!adsb_json_type(json->type))
                                 return 0;
 
-                            std::stringstream ss(json->json_string);
-                            nlohmann::json device_json;
+                            auto hex = adsb_json_hex(json->json_string);
+                            if (!hex)
+                                return 0;
 
+                            // AVR raw format, whatever form the source reported
                             try {
-                                ss >> device_json;
-
-                                auto hex_j = device_json["adsb"];
-
-                                if (hex_j.is_null() || !hex_j.is_string()) {
-                                    hex_j = device_json["adsb_raw_msg"];
-                                }
-
-                                auto adsb_content = 
-                                    fmt::format("{}\n", hex_j.get<std::string>());
-
-                                uptr->ws->write(adsb_content);
-                            } catch (std::exception& e) {
+                                uptr->ws->write(fmt::format("*{};\n", *hex));
+                            } catch (const std::exception& e) {
                                 return 0;
                             }
 
@@ -445,7 +491,7 @@ kis_adsb_phy::kis_adsb_phy(int in_phyid) :
                             if (json == nullptr)
                                 return 0;
 
-                            if (json->type != "adsb")
+                            if (!adsb_json_type(json->type))
                                 return 0;
 
                             auto src = in_pack->fetch<packetchain_comp_datasource>(uptr->adsb->pack_comp_datasource);
@@ -456,17 +502,13 @@ kis_adsb_phy::kis_adsb_phy(int in_phyid) :
                             if (src->ref_source->get_source_uuid() != uptr->srcuuid)
                                 return 0;
 
-                            std::stringstream ss(json->json_string);
-                            nlohmann::json device_json;
+                            auto hex = adsb_json_hex(json->json_string);
+                            if (!hex)
+                                return 0;
 
                             try {
-                                ss >> device_json;
-
-                                auto adsb_content = 
-                                    fmt::format("*{};\n", device_json["adsb"].get<std::string>());
-
-                                uptr->ws->write(adsb_content);
-                            } catch (std::exception& e) {
+                                uptr->ws->write(fmt::format("*{};\n", *hex));
+                            } catch (const std::exception& e) {
                                 return 0;
                             }
 
@@ -615,7 +657,7 @@ bool kis_adsb_phy::process_adsb_hex(nlohmann::json& json, const std::shared_ptr<
     auto mac = icao_to_mac(icao);
 
 
-    packet->common_info_ok = true;
+    packet->common_info.common_info_ok = true;
     packet->common_info.type = packet_basic_data;
     packet->common_info.phyid = fetch_phy_id();
     packet->common_info.datasize = 0;
@@ -626,13 +668,13 @@ bool kis_adsb_phy::process_adsb_hex(nlohmann::json& json, const std::shared_ptr<
 
     kis_lock_guard<kis_mutex> lk(devicetracker->get_devicelist_mutex(), "adsb_raw");
 
-    // Update the base dev without setting location, because we want to
-    // override that location ourselves later once we've gotten our
-    // adsb device and possibly merged packets
+    // The base device's location is where kismet was when it heard the
+    // aircraft; the aircraft's own position goes into its reported location
+    // once the adsb device has merged it
     std::shared_ptr<kis_tracked_device_base> basedev =
         devicetracker->update_common_device(mac, this, packet,
                 (UCD_UPDATE_FREQUENCIES | UCD_UPDATE_PACKETS |
-                 UCD_UPDATE_SEENBY), "ADSB");
+                 UCD_UPDATE_SEENBY | UCD_UPDATE_LOCATION), "ADSB");
 
     if (basedev == nullptr) {
         return 0;
@@ -713,7 +755,6 @@ bool kis_adsb_phy::process_adsb_hex(nlohmann::json& json, const std::shared_ptr<
 
             if (adsbdev->get_even_ts() - adsbdev->get_odd_ts() < 10)
                 calc_coords = true;
-
         } else {
             adsbdev->set_odd_raw_lat(location.lat);
             adsbdev->set_odd_raw_lon(location.lon);
@@ -773,25 +814,10 @@ bool kis_adsb_phy::process_adsb_hex(nlohmann::json& json, const std::shared_ptr<
     if (adsbdev->update_location) {
         adsbdev->update_location = false;
 
-        // Update the common device with location if we've got a location record now
-        // We have to make a new component here, not fetch the existing one; otherwise we 
-        // clobber the global gps record!
-        auto gpsinfo = packetchain->new_packet_component<kis_gps_packinfo>();
+        packet->reported_gps.set_reported(adsbdev->lat, adsbdev->lon, adsbdev->alt,
+                adsbdev->speed, adsbdev->heading, 0, packet->ts);
 
-        gpsinfo->lat = adsbdev->lat;
-        gpsinfo->lon = adsbdev->lon;
-        gpsinfo->speed = adsbdev->speed;
-        gpsinfo->alt = adsbdev->alt;
-        gpsinfo->heading = adsbdev->heading;
-
-        if (adsbdev->alt != 0)
-            gpsinfo->fix = 3;
-
-        gpsinfo->tv = packet->ts;
-
-        packet->insert(pack_comp_gps, gpsinfo);
-        devicetracker->update_common_device(mac, this, packet,
-                (UCD_UPDATE_LOCATION), "ADSB Transmitter");
+        devicetracker->update_common_device(mac, this, packet, (UCD_UPDATE_REPORTED_LOCATION), "ADSB Transmitter");
     }
 
     return true;
@@ -815,7 +841,7 @@ bool kis_adsb_phy::json_to_rtl(nlohmann::json& json, const std::shared_ptr<kis_p
     }
 
 
-    packet->common_info_ok = true;
+    packet->common_info.common_info_ok = true;
     packet->common_info.type = packet_basic_data;
     packet->common_info.phyid = fetch_phy_id();
     packet->common_info.datasize = 0;
@@ -830,13 +856,14 @@ bool kis_adsb_phy::json_to_rtl(nlohmann::json& json, const std::shared_ptr<kis_p
     packet->common_info.source = rtlmac;
     packet->common_info.transmitter = rtlmac;
 
-    // Update the base dev without setting location, because we want to
-    // override that location ourselves later once we've gotten our
-    // adsb device and possibly merged packets
+    // The base device's location is where kismet was when it heard the
+    // aircraft; the aircraft's own position goes into its reported location
+    // once the adsb device has merged it
+    bool new_device;
     std::shared_ptr<kis_tracked_device_base> basedev =
         devicetracker->update_common_device(rtlmac, this, packet,
                 (UCD_UPDATE_FREQUENCIES | UCD_UPDATE_PACKETS |
-                 UCD_UPDATE_SEENBY), "ADSB");
+                 UCD_UPDATE_SEENBY | UCD_UPDATE_LOCATION), "ADSB", new_device);
 
     kis_lock_guard<kis_mutex> lk(devicetracker->get_devicelist_mutex(), "adsb_json_to_rtl");
 
@@ -846,10 +873,12 @@ bool kis_adsb_phy::json_to_rtl(nlohmann::json& json, const std::shared_ptr<kis_p
         dn = json["icao"];
     } catch (...) { }
 
-    basedev->set_manuf(rtl_manuf);
+    if (new_device) {
+        basedev->set_manuf(rtl_manuf);
 
-    basedev->set_tracker_type_string(devicetracker->get_cached_devicetype("Airplane"));
-    basedev->set_devicename(fmt::format("ADSB {}", dn));
+        basedev->set_tracker_type_string(devicetracker->get_cached_devicetype("Airplane"));
+        basedev->set_devicename(fmt::format("ADSB {}", dn));
+    }
 
     std::shared_ptr<adsb_tracked_adsb> adsbdev;
 
@@ -911,24 +940,13 @@ bool kis_adsb_phy::json_to_rtl(nlohmann::json& json, const std::shared_ptr<kis_p
     if (adsbdev->update_location) {
         adsbdev->update_location = false;
 
-        // Update the common device with location if we've got a location record now
-        auto gpsinfo = packet->fetch_or_add<kis_gps_packinfo>(pack_comp_gps);
-
-        gpsinfo->lat = adsbdev->lat;
-        gpsinfo->lon = adsbdev->lon;
-        gpsinfo->speed = adsbdev->speed;
-        gpsinfo->alt = adsbdev->alt;
-        gpsinfo->heading = adsbdev->heading;
-
-        if (adsbdev->alt != 0)
-            gpsinfo->fix = 3;
-
-        gettimeofday(&gpsinfo->tv, NULL);
-
-        packet->insert(pack_comp_gps, gpsinfo);
+        struct timeval now;
+        gettimeofday(&now, NULL);
+        packet->reported_gps.set_reported(adsbdev->lat, adsbdev->lon, adsbdev->alt,
+                adsbdev->speed, adsbdev->heading, 0, now);
 
         devicetracker->update_common_device(rtlmac, this, packet,
-                (UCD_UPDATE_LOCATION), "ADSB Transmitter");
+                (UCD_UPDATE_REPORTED_LOCATION), "ADSB Transmitter");
     }
 
     return true;
@@ -1191,7 +1209,7 @@ double kis_adsb_phy::cpr_dlon(double lat, int odd) {
 void kis_adsb_phy::decode_cpr(const std::shared_ptr<adsb_tracked_adsb>& adsb,
         const std::shared_ptr<kis_packet>& packet) {
     /* This algorithm comes from:
-     * http://www.lll.lu/~edward/edward/adsb/DecodingADSBposition.html.
+     * https://www.lll.lu/~edward/edward/adsb/DecodingADSBposition.html.
      *
      *
      * A few remarks:
@@ -1297,7 +1315,12 @@ kis_adsb_phy::adsb_map_endp_handler(std::shared_ptr<kis_net_beast_httpd_connecti
 
             recent_devs->push_back(dev);
 
-            auto loc = dev->get_tracker_location();
+            // The map shows where aircraft say they are, so only their
+            // reported positions count toward its bounds.  Only look:
+            // get_reported_location() would create one.
+            std::shared_ptr<kis_tracked_location> loc;
+            if (dev->has_reported_location())
+                loc = dev->get_reported_location();
 
             if (loc != nullptr) {
                 auto last_loc = loc->get_last_loc();

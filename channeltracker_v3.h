@@ -42,15 +42,37 @@ public:
         device_rrd{std::move(c.device_rrd)} { }
 
     virtual void as_json(std::ostream& os, json_adapter_v2::opts *opts) override;
+    virtual void filtered_as_json(std::ostream& os, json_adapter_v2::opts *opts, const json_adapter_v2::field_group_map& fields) override;
 
 protected:
     std::string channel;
     double frequency;
-    kis_rrd_v2<> packets_rrd;
-    kis_rrd_v2<> data_rrd;
-    kis_rrd_v2<> device_rrd;
+    // Packets and bytes per second, and devices active on the frequency
+    kis_rrd_v2<kis_rrd_v2_sum_aggregator> packets_rrd;
+    kis_rrd_v2<kis_rrd_v2_sum_aggregator> data_rrd;
+    kis_rrd_v2<kis_rrd_v2_peak_aggregator> device_rrd;
     kis_tracked_signal_data_v2 signal_data;
 
+};
+
+template<> struct json_adapter_v2::json_encode<channel_tracker_v3_channel> {
+    void operator()(std::ostream& os, json_adapter_v2::opts *opts, channel_tracker_v3_channel& e) {
+        e.as_json(os, opts);
+    }
+
+    void operator()(std::ostream& os, json_adapter_v2::opts *opts, channel_tracker_v3_channel *e) {
+        e->as_json(os, opts);
+    }
+
+    void operator()(std::ostream& os, json_adapter_v2::opts *opts, channel_tracker_v3_channel& e,
+            json_adapter_v2::field_group_map& fields) {
+        e.filtered_as_json(os, opts, fields);
+    }
+
+    void operator()(std::ostream& os, json_adapter_v2::opts *opts, channel_tracker_v3_channel *e,
+            json_adapter_v2::field_group_map& fields) {
+        e->filtered_as_json(os, opts, fields);
+    }
 };
 
 class channel_tracker_v3 : public lifetime_global, public deferred_startup,
@@ -79,6 +101,7 @@ public:
     void update_device_counts(std::unordered_map<double, unsigned int> in_counts, time_t in_ts);
 
     virtual void as_json(std::ostream& os, json_adapter_v2::opts *opts) override;
+    virtual void filtered_as_json(std::ostream& os, json_adapter_v2::opts *opts, const json_adapter_v2::field_group_map& fields) override;
 
 protected:
     kis_mutex lock;
@@ -91,13 +114,36 @@ protected:
     static int packet_chain_handler(CHAINCALL_PARMS);
 
     // Seen channels as string-named channels, aggregated across all the phys
+    using channel_map_iter_t = std::unordered_map<std::string, channel_tracker_v3_channel>::iterator;
     std::unordered_map<std::string, channel_tracker_v3_channel> channel_map;
+
+    using frequency_map_iter_t = std::unordered_map<double, channel_tracker_v3_channel>::iterator;
     std::unordered_map<double, channel_tracker_v3_channel> frequency_map;
 
-    int pack_comp_l1data, pack_comp_devinfo, pack_comp_device;
+    int pack_comp_devinfo, pack_comp_device;
 
     int timer_id;
     int gather_devices_event(int event_id);
+};
+
+template<> struct json_adapter_v2::json_encode<channel_tracker_v3> {
+    void operator()(std::ostream& os, json_adapter_v2::opts *opts, channel_tracker_v3& e) {
+        e.as_json(os, opts);
+    }
+
+    void operator()(std::ostream& os, json_adapter_v2::opts *opts, channel_tracker_v3 *e) {
+        e->as_json(os, opts);
+    }
+
+    void operator()(std::ostream& os, json_adapter_v2::opts *opts, channel_tracker_v3& e,
+            json_adapter_v2::field_group_map& fields) {
+        e.filtered_as_json(os, opts, fields);
+    }
+
+    void operator()(std::ostream& os, json_adapter_v2::opts *opts, channel_tracker_v3 *e,
+            json_adapter_v2::field_group_map& fields) {
+        e->filtered_as_json(os, opts, fields);
+    }
 };
 
 #endif /* __CHANNELTRACKER_V3__ */

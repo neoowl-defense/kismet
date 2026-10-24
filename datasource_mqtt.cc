@@ -399,23 +399,16 @@ void kis_datasource_mqtt::open_interface(std::string in_definition, unsigned int
 
             packet->insert(ds->pack_comp_datasrc, datasrcinfo);
 
-            ds->inc_source_num_packets(1);
             ds->get_source_packet_rrd()->add_sample(1, Globalreg::globalreg->last_tv_sec);
 
             // Insert GPS data as soon as possible in the chain if there's no data
             // from the rest of the processing
-            if (packet->fetch(ds->pack_comp_gps) == nullptr &&
-                    packet->fetch(ds->pack_comp_no_gps) == nullptr) {
+            if (!packet->gps_info.gps_info_ok && !packet->suppress_gps) {
                 // If we haven't acquired the gpstracker, do so
                 if (ds->gpstracker == nullptr)
                     ds->gpstracker = Globalreg::fetch_mandatory_global_as<gps_tracker>();
 
-                auto gpsloc = ds->gpstracker->get_best_location();
-
-                if (gpsloc != nullptr) {
-                    packet->insert(ds->pack_comp_gps, std::move(gpsloc));
-                }
-
+				ds->gpstracker->get_best_location(packet->gps_info);
             }
 
             gettimeofday(&(packet->ts), NULL);

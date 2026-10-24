@@ -318,6 +318,9 @@ kis_tracked_location::kis_tracked_location(int in_id, std::shared_ptr<tracker_el
 
 kis_tracked_location::kis_tracked_location(const kis_tracked_location *p) :
     tracker_component(p) {
+		agg_x = agg_y = agg_z = agg_a = 0;
+		num_avg = num_alt_avg = 0;
+		last_location_time = 0;
 
         __ImportId(min_loc_id, p);
         __ImportId(max_loc_id, p);
@@ -349,11 +352,12 @@ void kis_tracked_location::add_loc_with_avg(double in_lat, double in_lon, double
     double mod_lat = in_lat * M_PI / 180;
     double mod_lon = in_lon * M_PI / 180;
 
-    agg_x += cos(mod_lat) * cos(mod_lon);
-    agg_y += cos(mod_lat) * sin(mod_lon);
-    agg_z += sin(mod_lat);
-
-    num_avg += 1;
+	if (in_lat != 0 && in_lon != 0) {
+		agg_x += cos(mod_lat) * cos(mod_lon);
+		agg_y += cos(mod_lat) * sin(mod_lon);
+		agg_z += sin(mod_lat);
+		num_avg += 1;
+	}
 
     if (fix > 2) {
         agg_a += in_alt;
@@ -370,15 +374,16 @@ void kis_tracked_location::add_loc_with_avg(double in_lat, double in_lon, double
 
     double r_alt = 0;
 
-    if (num_alt_avg > 0)
-       r_alt =  agg_a / num_alt_avg;
+    if (num_alt_avg > 0) {
+       r_alt = agg_a / num_alt_avg;
+	}
 
     // Use the incoming if we're the first packet
     if (num_avg > 1)
         avg_loc->set(central_lat * 180 / M_PI, central_lon * 180 / M_PI,
                      r_alt, num_alt_avg > 0 ? 3 : 2);
     else
-        avg_loc->set(in_lat, in_lon, in_alt, fix);
+        avg_loc->set(in_lat, in_lon, r_alt, fix);
 }
 
 void kis_tracked_location::add_loc(double in_lat, double in_lon, double in_alt,
@@ -416,31 +421,33 @@ void kis_tracked_location::add_loc(double in_lat, double in_lon, double in_alt,
     last_loc->set_speed(in_speed);
     last_loc->set_heading(in_heading);
 
-    double min_lat = min_loc->get_lat();
-    double max_lat = max_loc->get_lat();
-    double min_lon = min_loc->get_lon();
-    double max_lon = max_loc->get_lon();
+	if (in_lat != 0 && in_lon != 0) {
+		double min_lat = min_loc->get_lat();
+		double max_lat = max_loc->get_lat();
+		double min_lon = min_loc->get_lon();
+		double max_lon = max_loc->get_lon();
 
-    if (in_lat < min_loc->get_lat() || min_loc->get_lat() == 0) {
-        min_lat = in_lat;
-    }
+		if (in_lat < min_loc->get_lat() || min_loc->get_lat() == 0) {
+			min_lat = in_lat;
+		}
 
-    if (in_lat > max_loc->get_lat() || max_loc->get_lat() == 0) {
-        max_lat = in_lat;
-    }
+		if (in_lat > max_loc->get_lat() || max_loc->get_lat() == 0) {
+			max_lat = in_lat;
+		}
 
-    if (in_lon < min_loc->get_lon() || min_loc->get_lon() == 0) {
-        min_lon = in_lon;
-    }
+		if (in_lon < min_loc->get_lon() || min_loc->get_lon() == 0) {
+			min_lon = in_lon;
+		}
 
-    if (in_lon > max_loc->get_lon() || max_loc->get_lon() == 0) {
-        max_lon = in_lon;
-    }
+		if (in_lon > max_loc->get_lon() || max_loc->get_lon() == 0) {
+			max_lon = in_lon;
+		}
 
-    min_loc->set_location(min_lat, min_lon);
-    max_loc->set_location(max_lat, max_lon);
+		min_loc->set_location(min_lat, min_lon);
+		max_loc->set_location(max_lat, max_lon);
+	}
 
-    if (fix > 2) {
+    if (fix > 2 && in_alt != 0) {
         if (in_alt < min_loc->get_alt() || min_loc->get_alt() == 0) {
             min_loc->set_alt(in_alt);
         }

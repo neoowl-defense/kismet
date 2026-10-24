@@ -29,6 +29,7 @@
 #include <map>
 #include <vector>
 #include <algorithm>
+#include <atomic>
 #include <string>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -66,11 +67,15 @@
 #include "dot11_parsers/dot11_ie_11_qbss.h"
 #include "dot11_parsers/dot11_ie_33_power.h"
 #include "dot11_parsers/dot11_ie_36_supported_channels.h"
+#include "dot11_parsers/dot11_ie_37_csa.h"
 #include "dot11_parsers/dot11_ie_48_rsn.h"
 #include "dot11_parsers/dot11_ie_54_mobility.h"
 #include "dot11_parsers/dot11_ie_61_ht_op.h"
 #include "dot11_parsers/dot11_ie_192_vht_op.h"
 #include "dot11_parsers/dot11_ie_221_dji_droneid.h"
+#include "dot11_parsers/dot11_ie_221_mikrotik.h"
+#include "dot11_parsers/dot11_ie_221_ubnt_airmax_ac.h"
+#include "dot11_parsers/dot11_ie_221_ubnt_airmax_m.h"
 #include "dot11_parsers/dot11_ie_221_wpa_transition.h"
 #include "dot11_parsers/dot11_ie_221_wfa_wpa.h"
 #include "dot11_parsers/dot11_ie_232_s1g_operation.h"
@@ -90,8 +95,9 @@ class dot11_wep_key {
         mac_addr bssid;
         unsigned char key[DOT11_WEPKEY_MAX];
         unsigned int len;
-        unsigned int decrypted;
-        unsigned int failed;
+        // Updated by any packet thread
+        std::atomic<unsigned int> decrypted;
+        std::atomic<unsigned int> failed;
 };
 
 // dot11 packet components
@@ -115,6 +121,23 @@ class dot11_packinfo_dot11d_entry {
 #define DOT11_SSID_PROBERESP        (1 << 1)
 #define DOT11_SSID_PROBEREQ         (1 << 2)
 #define DOT11_SSID_FILE             (1 << 3)
+
+// A channel switch announcement carried by a frame: a CSA or ECSA element in a beacon or
+// probe response, or a spectrum management / public action frame
+struct dot11_chan_switch {
+    enum class source : uint8_t { none, csa_ie, ecsa_ie, action_csa, action_ecsa };
+
+    source src = source::none;
+    uint8_t mode = 0;
+    // ECSA only
+    uint8_t op_class = 0;
+    uint8_t new_channel = 0;
+    uint8_t count = 0;
+    // The channel a beacon or probe response advertises (DS or HT primary channel), 0 if none
+    uint8_t cur_channel = 0;
+
+    bool present() const { return src != source::none; }
+};
 
 // Packet info decoded by the dot11 phy decoder
 // 
@@ -175,6 +198,8 @@ class dot11_packinfo : public packet_component {
             wps_model_number = "";
             wps_serial_number = "";
             wps_uuid_e = "";
+            broadcom_ie = false;
+            wps_broadcom_uuid = false;
 
             mgt_reason_code = 0;
 
@@ -201,6 +226,7 @@ class dot11_packinfo : public packet_component {
             qbss.reset();
             tx_power.reset();
             supported_channels.reset();
+            chan_switch = dot11_chan_switch{};
             dot11r_mobility.reset();
             dot11vht.reset();
             dot11ht.reset();
@@ -208,6 +234,10 @@ class dot11_packinfo : public packet_component {
             rsn.reset();
             droneid.reset();
             s1g.reset();
+
+            airmax_ac.reset();
+            airmax_m.reset();
+            mikrotik.reset();
 
             basic_rates.clear();
             extended_rates.clear();
@@ -315,10 +345,19 @@ class dot11_packinfo : public packet_component {
         std::string wps_serial_number;
         std::string wps_uuid_e;
 
+        // Broadcom SDK evidence for the BCMWPSMONITOR assessment: Broadcom's 9 byte
+        // proprietary element, and the fixed UUID-E the SDK ships with
+        bool broadcom_ie;
+        bool wps_broadcom_uuid;
+
         // Direct kaitai structs pulled from the beacon
         dot11_ie_11_qbss qbss;
         dot11_ie_33_power tx_power;
+        dot11_ie_37_csa csa;
         dot11_ie_36_supported_channels supported_channels;
+
+        // Parsed for every frame by the dissector, unlike the IE tags above
+        dot11_chan_switch chan_switch;
         dot11_ie_54_mobility dot11r_mobility;
         dot11_ie_61_ht_op dot11ht;
         dot11_ie_192_vht_op dot11vht;
@@ -329,6 +368,11 @@ class dot11_packinfo : public packet_component {
         dot11_ie_232_s1g_operation s1g_operation;
 
         std::shared_ptr<dot11_ie_221_dji_droneid> droneid;
+
+        // AirMAX payloads are only kept when they decrypt to the source MAC
+        dot11_ie_221_ubnt_airmax_ac airmax_ac;
+        dot11_ie_221_ubnt_airmax_m airmax_m;
+        dot11_ie_221_mikrotik mikrotik;
 
         double maxrate;
         // 11g rates
@@ -437,6 +481,11 @@ public:
     int packet_wep_decryptor(kis_packet* in_pack);
     // Top-level dissector; decodes basic type and populates the dot11 packet
     int packet_dot11_dissector(kis_packet* in_pack);
+    void hidedata_truncate(kis_packet* in_pack, const std::shared_ptr<kis_datachunk>& chunk,
+            const std::shared_ptr<dot11_packinfo>& packinfo);
+
+    // Thread assignment from the raw header, run before the packet is queued
+    int packet_dot11_assign_thread(kis_packet *in_pack);
     // Expects an existing dot11 packet with the basic type intact, interprets
     // IE tags to the best of our ability
     int packet_dot11_ie_dissector(kis_packet* in_pack, dot11_packinfo* in_dot11info);
@@ -448,6 +497,25 @@ public:
 
     // Is packet a WPS M3 message?  Used to detect Reaver, etc
     int packet_dot11_wps_m3(const kis_packet* in_pack);
+
+    // EAP-WSC (WPS) header of an unencrypted EAPOL data frame, for the fragment alerts
+    struct wsc_frame_info {
+        uint8_t eap_code = 0;
+        bool wsc = false;
+        uint8_t opcode = 0;
+        bool more_fragments = false;
+        bool has_message_length = false;
+        uint16_t message_length = 0;
+        size_t fragment_length = 0;
+    };
+
+    bool packet_dot11_wsc(const kis_packet* in_pack, wsc_frame_info& info);
+
+    // Track WSC fragment reassembly per AP and station and look for attacks on it, and
+    // for the zero length fragment that tells Broadcom's wps_monitor from hostapd
+    void handle_wsc_fragments(kis_packet* in_pack, dot11_packinfo* dot11info);
+    void handle_wsc_deauth(kis_packet* in_pack, dot11_packinfo* dot11info);
+    void confirm_broadcom_wps(kis_packet* in_pack, dot11_packinfo* dot11info);
 
     // Is the packet a WPA handshake?  Return an eapol tracker element if so
     std::shared_ptr<dot11_tracked_eapol> packet_dot11_eapol_handshake(kis_packet* in_pack,
@@ -476,6 +544,7 @@ public:
 
     void set_string_extract(int in_extr);
 
+    // Only safe before packet processing starts; packet threads read wepkeys unlocked
     void add_wep_key(mac_addr bssid, uint8_t *key, unsigned int len, int temp);
 
     static std::string crypt_to_string(uint64_t cryptset);
@@ -513,6 +582,11 @@ public:
 
     virtual bool device_is_a(const std::shared_ptr<kis_tracked_device_base>& dev) override;
 
+    // Every 802.11 device update holds that device's lock
+    virtual bool uses_device_locking() const override {
+        return true;
+    }
+
     std::shared_ptr<dot11_tracked_device> fetch_dot11_record(const std::shared_ptr<kis_tracked_device_base>& dev);
 
 protected:
@@ -528,25 +602,27 @@ protected:
     void handle_ssid(const std::shared_ptr<kis_tracked_device_base>& basedev,
             const std::shared_ptr<dot11_tracked_device>& dot11dev,
             const std::shared_ptr<kis_packet>& in_pack,
-            const std::shared_ptr<kis_layer1_packinfo>& l1info,
-            const std::shared_ptr<dot11_packinfo>& dot11info,
-            const std::shared_ptr<kis_gps_packinfo>& pack_gpsinfo);
+            const std::shared_ptr<dot11_packinfo>& dot11info);
 
     void handle_ssid_s1g(const std::shared_ptr<kis_tracked_device_base>& basedev,
             const std::shared_ptr<dot11_tracked_device>& dot11dev,
             const std::shared_ptr<kis_packet>& in_pack,
-            const std::shared_ptr<kis_layer1_packinfo>& l1info,
-            const std::shared_ptr<dot11_packinfo>& dot11info,
-            const std::shared_ptr<kis_gps_packinfo>& pack_gpsinfo);
+            const std::shared_ptr<dot11_packinfo>& dot11info);
+
+    // Check the channel switch announcement of a beacon, probe response or action frame
+    // for floods and spoofing; called for every frame, since handle_ssid skips identical IE tags
+    void handle_chan_switch(const std::shared_ptr<kis_tracked_device_base>& bssid_dev,
+            const std::shared_ptr<dot11_tracked_device>& bssid_dot11,
+            const std::shared_ptr<kis_packet>& in_pack,
+            const std::shared_ptr<dot11_packinfo>& dot11info);
 
     // Handle probed SSIDs
     void handle_probed_ssid(const std::shared_ptr<kis_tracked_device_base>& basedev,
             const std::shared_ptr<dot11_tracked_device>& dot11dev,
             const std::shared_ptr<kis_packet>& in_pack,
-            const std::shared_ptr<dot11_packinfo>& dot11info,
-            const std::shared_ptr<kis_gps_packinfo>& pack_gpsinfo);
+            const std::shared_ptr<dot11_packinfo>& dot11info);
 
-    // Map a device as a client of an acceess point, fill in any data in the
+    // Map a device as a client of an access point, fill in any data in the
     // per-client records
     void process_client(const std::shared_ptr<kis_tracked_device_base>& bssiddev,
             const std::shared_ptr<dot11_tracked_device>& bssiddot11,
@@ -554,7 +630,6 @@ protected:
             const std::shared_ptr<dot11_tracked_device>& clientdot11,
             const std::shared_ptr<kis_packet>& in_pack,
             const std::shared_ptr<dot11_packinfo>& dot11info,
-            const std::shared_ptr<kis_gps_packinfo>& pack_gpsinfo,
             const std::shared_ptr<kis_data_packinfo>& pack_datainfo);
 
     void process_wpa_handshake(const std::shared_ptr<kis_tracked_device_base>& bssid_dev,
@@ -573,8 +648,6 @@ protected:
 
     int load_wepkeys();
 
-    std::map<mac_addr, std::string> bssid_cloak_map;
-
     std::string ssid_cache_path, ip_cache_path;
     int ssid_cache_track, ip_cache_track;
 
@@ -584,8 +657,8 @@ protected:
     // Packet components
     int pack_comp_80211, pack_comp_basicdata, pack_comp_mangleframe,
         pack_comp_strings, pack_comp_checksum, pack_comp_linkframe,
-        pack_comp_decap, pack_comp_datapayload,
-        pack_comp_gps, pack_comp_l1info, pack_comp_json;
+        pack_comp_decap, pack_comp_datapayload, pack_comp_json,
+        pack_comp_remoteid;
 
     // Do we do any data dissection or do we hide it all (legal safety
     // cutout)
@@ -594,7 +667,8 @@ protected:
     // Do we pull strings?
     int dissect_strings, dissect_all_strings;
 
-    // SSID regex filter
+    // SSID regex filter; like the canary map and IE fingerprint lists, filled at startup
+    // and read without locking by packet threads
     std::shared_ptr<tracker_element_vector> ssid_regex_vec;
     int ssid_regex_vec_element_id;
 
@@ -610,11 +684,13 @@ protected:
         alert_dhcpclient_ref, alert_wmm_ref, alert_nonce_zero_ref, 
         alert_nonce_duplicate_ref, alert_11kneighborchan_ref, alert_probechan_ref,
         alert_rtlwifi_p2p_ref, alert_deauthflood_ref, alert_noclientmfp_ref,
-        alert_rtl8195_vdoo_ref, alert_vdoo_2020_27301_ref, alert_vdoo_2020_27302_ref;
+        alert_rtl8195_vdoo_ref, alert_vdoo_2020_27301_ref, alert_vdoo_2020_27302_ref,
+        alert_dot11_csa_ch14_ref;
 
     // Are we allowed to send wepkeys to the client (server config)
     int client_wepkey_allowed;
-    // Map of wepkeys to BSSID (or bssid masks)
+    // Map of wepkeys to BSSID (or bssid masks); filled at startup and read without locking
+    // by packet threads, so it must not change once packets are being processed
     std::map<mac_addr, dot11_wep_key *> wepkeys;
 
     // Generated WEP identity / base
@@ -627,7 +703,22 @@ protected:
         alert_cryptchange_ref, alert_malformmgmt_ref, alert_wpsbrute_ref, 
         alert_l33t_ref, alert_tooloud_ref, alert_atheros_wmmtspec_ref,
         alert_atheros_rsnloop_ref, alert_bssts_ref, alert_qcom_extended_ref,
-        alert_bad_fixlen_ie, alert_formatstring_ref;
+        alert_bad_fixlen_ie, alert_formatstring_ref, alert_dot11_csa_flood_ref,
+        alert_dot11_csa_spoof_ref,
+        alert_bcmwps_ref, alert_wpsfraglen_ref, alert_wpsfragprobe_ref;
+
+    // EAP-WSC fragment reassembly per AP and station; only WSC frames touch it, and it is
+    // bounded in size and age
+    struct wsc_frag_state {
+        uint16_t declared = 0;
+        size_t seen = 0;
+        time_t last = 0;
+        // A zero length first fragment was sent and the AP hasn't answered yet
+        bool probe_pending = false;
+    };
+
+    kis_mutex wsc_frag_mutex;
+    std::map<std::pair<mac_addr, mac_addr>, wsc_frag_state> wsc_frag_map;
 
     int signal_too_loud_threshold;
 
@@ -635,13 +726,6 @@ protected:
     int addfiltercmd_ref, addnetclifiltercmd_ref;
 
     int proto_ref_ssid, proto_ref_device, proto_ref_client;
-
-    // SSID cloak file as a config file
-    config_file *ssid_conf;
-    time_t conf_save;
-
-    // probe assoc to owning network
-    std::map<mac_addr, kis_tracked_device_base *> probe_assoc_map;
 
     // Do we time out components of devices?
     int device_idle_expiration;
@@ -678,6 +762,9 @@ protected:
 
     // Do we only get signal from beacons?
     bool signal_from_beacon;
+
+    // Hold the device list for the whole of each packet, as before per-device locking
+    bool global_device_lock;
 
     // Do we associate devices by bssts?
     bool associate_by_bssts;

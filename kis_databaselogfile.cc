@@ -42,9 +42,6 @@ kis_database_logfile::kis_database_logfile():
         Globalreg::fetch_mandatory_global_as<packet_chain>("PACKETCHAIN");
 
     pack_comp_device = packetchain->register_packet_component("DEVICE");
-    pack_comp_radiodata = packetchain->register_packet_component("RADIODATA");
-    pack_comp_gps = packetchain->register_packet_component("GPS");
-    pack_comp_no_gps = packetchain->register_packet_component("NOGPS");
     pack_comp_linkframe = packetchain->register_packet_component("LINKFRAME");
     pack_comp_datasource = packetchain->register_packet_component("KISDATASRC");
     pack_comp_metablob = packetchain->register_packet_component("METABLOB");
@@ -56,10 +53,13 @@ kis_database_logfile::kis_database_logfile():
         Globalreg::fetch_mandatory_global_as<device_tracker>();
 
     db_enabled = false;
+    close_pending = false;
 
     message_evt_id = 0;
     alert_evt_id = 0;
 }
+
+thread_local kis_database_logfile *kis_database_logfile::current_writer = nullptr;
 
 kis_database_logfile::~kis_database_logfile() {
     eventbus->remove_listener(message_evt_id);
@@ -108,7 +108,9 @@ bool kis_database_logfile::open_log(const std::string& in_template, const std::s
         timetracker->register_timer(SERVER_TIMESLICES_SEC * 10, NULL, 1,
             [this](int) -> int {
 
-            // local_locker dblock(&ds_mutex, "kismetdb transaction_timer");
+            db_writer_guard writer_lk(this);
+            if (!db_enabled)
+                return 1;
 
             in_transaction_sync = true;
 
@@ -140,6 +142,10 @@ bool kis_database_logfile::open_log(const std::string& in_template, const std::s
             timetracker->register_timer(SERVER_TIMESLICES_SEC * 15, NULL, 1,
                     [this](int) -> int {
 
+                    db_writer_guard writer_lk(this);
+                    if (!db_enabled)
+                        return 1;
+
                     auto pkt_delete =
                         fmt::format("DELETE FROM packets WHERE ts_sec < {}",
                                 time(0) - packet_timeout);
@@ -164,6 +170,10 @@ bool kis_database_logfile::open_log(const std::string& in_template, const std::s
             timetracker->register_timer(SERVER_TIMESLICES_SEC * 60, NULL, 1,
                     [this](int) -> int {
 
+                    db_writer_guard writer_lk(this);
+                    if (!db_enabled)
+                        return 1;
+
                     auto pkt_delete =
                         fmt::format("DELETE FROM devices WHERE last_time < {}",
                                 time(0) - device_timeout);
@@ -183,6 +193,10 @@ bool kis_database_logfile::open_log(const std::string& in_template, const std::s
         message_timeout_timer =
             timetracker->register_timer(SERVER_TIMESLICES_SEC * 60, NULL, 1,
                     [this](int) -> int {
+
+                    db_writer_guard writer_lk(this);
+                    if (!db_enabled)
+                        return 1;
 
                     auto pkt_delete =
                         fmt::format("DELETE FROM messages WHERE ts_sec < {}",
@@ -204,6 +218,10 @@ bool kis_database_logfile::open_log(const std::string& in_template, const std::s
             timetracker->register_timer(SERVER_TIMESLICES_SEC * 60, NULL, 1,
                     [this](int) -> int {
 
+                    db_writer_guard writer_lk(this);
+                    if (!db_enabled)
+                        return 1;
+
                     auto pkt_delete =
                         fmt::format("DELETE FROM alerts WHERE ts_sec < {}",
                                 time(0) - alert_timeout);
@@ -223,6 +241,10 @@ bool kis_database_logfile::open_log(const std::string& in_template, const std::s
         snapshot_timeout_timer =
             timetracker->register_timer(SERVER_TIMESLICES_SEC * 60, NULL, 1,
                     [this](int) -> int {
+
+                    db_writer_guard writer_lk(this);
+                    if (!db_enabled)
+                        return 1;
 
                     auto pkt_delete =
                         fmt::format("DELETE FROM snapshots WHERE ts_sec < {}",
@@ -255,6 +277,31 @@ bool kis_database_logfile::open_log(const std::string& in_template, const std::s
                 [this](std::shared_ptr<kis_net_beast_httpd_connection> con) {
                     return make_poi_endp_handler(con);
                 }));
+
+    poi_entry_id =
+        Globalreg::globalreg->entrytracker->register_field("kismet.poi",
+                tracker_element_factory<tracker_element_map>(),
+                "point of interest");
+    poi_ts_sec_id =
+        Globalreg::globalreg->entrytracker->register_field("kismet.poi.ts_sec",
+                tracker_element_factory<tracker_element_uint64>(),
+                "point of interest timestamp, seconds");
+    poi_ts_usec_id =
+        Globalreg::globalreg->entrytracker->register_field("kismet.poi.ts_usec",
+                tracker_element_factory<tracker_element_uint64>(),
+                "point of interest timestamp, microseconds");
+    poi_lat_id =
+        Globalreg::globalreg->entrytracker->register_field("kismet.poi.lat",
+                tracker_element_factory<tracker_element_double>(),
+                "point of interest latitude (0 without a GPS fix)");
+    poi_lon_id =
+        Globalreg::globalreg->entrytracker->register_field("kismet.poi.lon",
+                tracker_element_factory<tracker_element_double>(),
+                "point of interest longitude (0 without a GPS fix)");
+    poi_note_id =
+        Globalreg::globalreg->entrytracker->register_field("kismet.poi.note",
+                tracker_element_factory<tracker_element_string>(),
+                "point of interest note");
 
     httpd->register_route("/poi/list_poi", {"GET", "POST"}, httpd->RO_ROLE, {},
             std::make_shared<kis_net_web_tracked_endpoint>(
@@ -421,10 +468,15 @@ bool kis_database_logfile::open_log(const std::string& in_template, const std::s
 }
 
 void kis_database_logfile::close_log() {
-#if 0
-    kis_unique_lock<kis_mutex> dblock(ds_mutex, std::defer_lock, "kismetdb close_log");
-    db_lock_with_sync_check(dblock, return);
-#endif
+    // Stop new writers first, so a busy packet stream can't starve the close below
+    db_enabled = false;
+
+    // Called from a writer (an error path) holding the lifetime lock; waiting for the
+    // writers in flight would wait on ourselves, the writer's guard finishes the close
+    if (current_writer == this) {
+        close_pending = true;
+        return;
+    }
 
     // Kill the timers
     auto timetracker =
@@ -450,8 +502,14 @@ void kis_database_logfile::close_log() {
     if (packetchain != NULL && packet_handler_id >= 0)
         packetchain->remove_handler(packet_handler_id, CHAINPOS_LOGGING);
 
+    // Wait for anything still using the database, then close it
+    std::unique_lock<std::shared_mutex> lifetime_lk(db_lifetime_mutex);
+
     set_int_log_open(false);
-    db_enabled = false;
+
+    // Already closed
+    if (db == nullptr)
+        return;
 
     // End the transaction
     sqlite3_exec(db, "END TRANSACTION", NULL, NULL, NULL);
@@ -461,6 +519,16 @@ void kis_database_logfile::close_log() {
     sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
 
     database_close();
+}
+
+// Bind a gps record's position, or zeros if there's no usable one
+static void bind_gps(sqlite3_stmt *stmt, int& pos, const kis_gps_packinfo *gps) {
+    bool ok = gps != nullptr && gps->gps_info_ok;
+    sqlite3_bind_double(stmt, pos++, ok ? gps->lat : 0);
+    sqlite3_bind_double(stmt, pos++, ok ? gps->lon : 0);
+    sqlite3_bind_double(stmt, pos++, ok ? gps->alt : 0);
+    sqlite3_bind_double(stmt, pos++, ok ? gps->speed : 0);
+    sqlite3_bind_double(stmt, pos++, ok ? gps->heading : 0);
 }
 
 int kis_database_logfile::database_upgrade_db() {
@@ -493,6 +561,13 @@ int kis_database_logfile::database_upgrade_db() {
 
         "avg_lat REAL, " // Average location
         "avg_lon REAL, "
+
+        "reported_min_lat REAL, " // Bounds and average of the location the device reports
+        "reported_min_lon REAL, " // for itself (adsb, ais, remote id...), 0 if it doesn't
+        "reported_max_lat REAL, "
+        "reported_max_lon REAL, "
+        "reported_avg_lat REAL, "
+        "reported_avg_lon REAL, "
 
         "bytes_data INT, " // Amount of data seen on device
 
@@ -528,11 +603,17 @@ int kis_database_logfile::database_upgrade_db() {
 
         "devkey TEXT, " // Device key
 
-        "lat REAL, " // location
+        "lat REAL, " // location of kismet when the packet was seen
         "lon REAL, "
         "alt REAL, "
         "speed REAL, "
         "heading REAL, "
+
+        "reported_lat REAL, " // location the device reported in the packet, 0 if none
+        "reported_lon REAL, "
+        "reported_alt REAL, "
+        "reported_speed REAL, "
+        "reported_heading REAL, "
 
         "packet_len INT, " // Packet length
 
@@ -574,11 +655,17 @@ int kis_database_logfile::database_upgrade_db() {
         "phyname TEXT, " // Packet name and phy
         "devmac TEXT, "
 
-        "lat REAL, " // Location
+        "lat REAL, " // Location of kismet
         "lon REAL, "
         "alt REAL, "
         "speed REAL, "
         "heading REAL, "
+
+        "reported_lat REAL, " // Location the device reported, 0 if none
+        "reported_lon REAL, "
+        "reported_alt REAL, "
+        "reported_speed REAL, "
+        "reported_heading REAL, "
 
         "datasource TEXT, " // UUID of data source
 
@@ -712,6 +799,10 @@ void kis_database_logfile::handle_message(std::shared_ptr<tracked_message> msg) 
     if (!db_enabled)
         return;
 
+    db_writer_guard writer_lk(this);
+    if (!db_enabled)
+        return;
+
     int r;
     std::string sql;
     sqlite3_stmt *msg_stmt;
@@ -781,6 +872,10 @@ int kis_database_logfile::log_device(const std::shared_ptr<kis_tracked_device_ba
     if (!db_enabled)
         return 0;
 
+    db_writer_guard writer_lk(this);
+    if (!db_enabled)
+        return 0;
+
     std::string sql;
 
     std::string phystring;
@@ -834,8 +929,10 @@ int kis_database_logfile::log_device(const std::shared_ptr<kis_tracked_device_ba
         "(first_time, last_time, devkey, phyname, devmac, strongest_signal, "
         "min_lat, min_lon, max_lat, max_lon, "
         "avg_lat, avg_lon, "
+        "reported_min_lat, reported_min_lon, reported_max_lat, reported_max_lon, "
+        "reported_avg_lat, reported_avg_lon, "
         "bytes_data, type, device) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
     r = sqlite3_prepare(db, sql.c_str(), sql.length(), &device_stmt, &device_pz);
 
@@ -856,30 +953,24 @@ int kis_database_logfile::log_device(const std::shared_ptr<kis_tracked_device_ba
             macstring.length(), SQLITE_TRANSIENT);
     sqlite3_bind_int(device_stmt, spos++, d->get_signal_data()->get_max_signal());
 
-    if (d->has_location() && (d->get_location()->has_min_loc() &&
-                              d->get_location()->has_max_loc() &&
-                              d->get_location()->has_avg_loc())) {
-        sqlite3_bind_double(device_stmt, spos++,
-                            d->get_location()->get_min_loc()->get_lat());
-        sqlite3_bind_double(device_stmt, spos++,
-                            d->get_location()->get_min_loc()->get_lon());
-        sqlite3_bind_double(device_stmt, spos++,
-                            d->get_location()->get_max_loc()->get_lat());
-        sqlite3_bind_double(device_stmt, spos++,
-                            d->get_location()->get_max_loc()->get_lon());
-        sqlite3_bind_double(device_stmt, spos++,
-                            d->get_location()->get_avg_loc()->get_lat());
-        sqlite3_bind_double(device_stmt, spos++,
-                            d->get_location()->get_avg_loc()->get_lon());
-    } else {
-        // Empty location
-        sqlite3_bind_double(device_stmt, spos++, 0);
-        sqlite3_bind_double(device_stmt, spos++, 0);
-        sqlite3_bind_double(device_stmt, spos++, 0);
-        sqlite3_bind_double(device_stmt, spos++, 0);
-        sqlite3_bind_double(device_stmt, spos++, 0);
-        sqlite3_bind_double(device_stmt, spos++, 0);
-    }
+    // Bounds and average of a location set, or zeros if there isn't one
+    auto bind_location = [&device_stmt, &spos](const std::shared_ptr<kis_tracked_location>& loc) {
+        if (loc != nullptr && loc->has_min_loc() && loc->has_max_loc() && loc->has_avg_loc()) {
+            sqlite3_bind_double(device_stmt, spos++, loc->get_min_loc()->get_lat());
+            sqlite3_bind_double(device_stmt, spos++, loc->get_min_loc()->get_lon());
+            sqlite3_bind_double(device_stmt, spos++, loc->get_max_loc()->get_lat());
+            sqlite3_bind_double(device_stmt, spos++, loc->get_max_loc()->get_lon());
+            sqlite3_bind_double(device_stmt, spos++, loc->get_avg_loc()->get_lat());
+            sqlite3_bind_double(device_stmt, spos++, loc->get_avg_loc()->get_lon());
+        } else {
+            for (int i = 0; i < 6; i++)
+                sqlite3_bind_double(device_stmt, spos++, 0);
+        }
+    };
+
+    // Where kismet heard the device, then where the device says it is
+    bind_location(d->has_location() ? d->get_location() : nullptr);
+    bind_location(d->has_reported_location() ? d->get_reported_location() : nullptr);
 
     sqlite3_bind_int64(device_stmt, spos++, d->get_datasize());
     sqlite3_bind_text(device_stmt, spos++, typestring.c_str(),
@@ -910,6 +1001,10 @@ int kis_database_logfile::log_packet(const kis_packet* in_pack) {
         return 0;
     }
 
+    db_writer_guard writer_lk(this);
+    if (!db_enabled)
+        return 0;
+
     std::string phystring;
     std::string macstring;
     std::string deststring;
@@ -929,8 +1024,6 @@ int kis_database_logfile::log_packet(const kis_packet* in_pack) {
     }
 
     auto chunk = in_pack->fetch<kis_datachunk>(pack_comp_linkframe);
-    auto radioinfo = in_pack->fetch<kis_layer1_packinfo>(pack_comp_radiodata);
-    auto gpsdata = in_pack->fetch<kis_gps_packinfo>(pack_comp_gps);
     auto datasrc = in_pack->fetch<packetchain_comp_datasource>(pack_comp_datasource);
     auto metablob = in_pack->fetch<packet_metablob>(pack_comp_metablob);
     auto jsonblob = in_pack->fetch<kis_json_packinfo>(pack_comp_json);
@@ -940,7 +1033,7 @@ int kis_database_logfile::log_packet(const kis_packet* in_pack) {
     // Packets are no longer a 1:1 with a device
     keystring = "0";
 
-    if (in_pack->common_info_ok) {
+    if (in_pack->common_info.common_info_ok) {
         if (in_pack->common_info.type == packet_basic_data && !log_data_packets)
             return 0;
 
@@ -980,11 +1073,12 @@ int kis_database_logfile::log_packet(const kis_packet* in_pack) {
             "(ts_sec, ts_usec, phyname, "
             "sourcemac, destmac, transmac, devkey, frequency, "
             "lat, lon, alt, speed, heading, "
+            "reported_lat, reported_lon, reported_alt, reported_speed, reported_heading, "
             "packet_len, packet_full_len, signal, "
             "datasource, "
             "dlt, packet, "
             "error, tags, datarate, hash, packetid) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
         r = sqlite3_prepare(db, sql.c_str(), sql.length(), &packet_stmt, &packet_pz);
 
@@ -1007,25 +1101,15 @@ int kis_database_logfile::log_packet(const kis_packet* in_pack) {
         sqlite3_bind_text(packet_stmt, sql_pos++, keystring.c_str(), keystring.length(), SQLITE_TRANSIENT);
         sqlite3_bind_double(packet_stmt, sql_pos++, frequency);
 
-        if (gpsdata != NULL) {
-            sqlite3_bind_double(packet_stmt, sql_pos++, gpsdata->lat);
-            sqlite3_bind_double(packet_stmt, sql_pos++, gpsdata->lon);
-            sqlite3_bind_double(packet_stmt, sql_pos++, gpsdata->alt);
-            sqlite3_bind_double(packet_stmt, sql_pos++, gpsdata->speed);
-            sqlite3_bind_double(packet_stmt, sql_pos++, gpsdata->heading);
-        } else {
-            sqlite3_bind_double(packet_stmt, sql_pos++, 0);
-            sqlite3_bind_double(packet_stmt, sql_pos++, 0);
-            sqlite3_bind_double(packet_stmt, sql_pos++, 0);
-            sqlite3_bind_double(packet_stmt, sql_pos++, 0);
-            sqlite3_bind_double(packet_stmt, sql_pos++, 0);
-        }
+        // Where kismet was, then where the device said it was
+        bind_gps(packet_stmt, sql_pos, &in_pack->gps_info);
+        bind_gps(packet_stmt, sql_pos, &in_pack->reported_gps);
 
         sqlite3_bind_int64(packet_stmt, sql_pos++, chunk->length());
         sqlite3_bind_int64(packet_stmt, sql_pos++, in_pack->original_len);
 
-        if (radioinfo != nullptr) {
-            sqlite3_bind_int(packet_stmt, sql_pos++, radioinfo->signal_dbm);
+        if (in_pack->signal_info.data_ok) {
+            sqlite3_bind_int(packet_stmt, sql_pos++, in_pack->signal_info.signal_dbm);
         } else {
             sqlite3_bind_int(packet_stmt, sql_pos++, 0);
         }
@@ -1051,8 +1135,8 @@ int kis_database_logfile::log_packet(const kis_packet* in_pack) {
         auto str = tagstream.str();
         sqlite3_bind_text(packet_stmt, sql_pos++, str.c_str(), tagstream.str().length(), SQLITE_TRANSIENT);
 
-        if (radioinfo != nullptr)
-            sqlite3_bind_double(packet_stmt, sql_pos++, radioinfo->datarate / 10);
+        if (in_pack->signal_info.data_ok)
+            sqlite3_bind_double(packet_stmt, sql_pos++, in_pack->signal_info.datarate / 10);
         else
             sqlite3_bind_double(packet_stmt, sql_pos++, 0);
 
@@ -1080,26 +1164,26 @@ int kis_database_logfile::log_packet(const kis_packet* in_pack) {
         mac_addr smac("00:00:00:00:00:00");
         uuid puuid;
 
-        if (in_pack->common_info_ok)
+        if (in_pack->common_info.common_info_ok)
             smac = in_pack->common_info.source;
 
         if (datasrc != nullptr)
             puuid = datasrc->ref_source->get_source_uuid();
 
-        log_data(gpsdata.get(), radioinfo.get(), in_pack->ts, phystring, smac, puuid,
-                metablob->meta_type, metablob->meta_data);
+        log_data(&in_pack->gps_info, &in_pack->signal_info, in_pack->ts, phystring, smac, puuid,
+                metablob->meta_type, metablob->meta_data, &in_pack->reported_gps);
     } else if (jsonblob != nullptr) {
         mac_addr smac("00:00:00:00:00:00");
         uuid puuid;
 
-        if (in_pack->common_info_ok)
+        if (in_pack->common_info.common_info_ok)
             smac = in_pack->common_info.source;
 
         if (datasrc != nullptr)
             puuid = datasrc->ref_source->get_source_uuid();
 
-        log_data(gpsdata.get(), radioinfo.get(), in_pack->ts, phystring, smac, puuid,
-                jsonblob->type, jsonblob->json_string);
+        log_data(&in_pack->gps_info, &in_pack->signal_info, in_pack->ts, phystring, smac, puuid,
+                jsonblob->type, jsonblob->json_string, &in_pack->reported_gps);
     }
 
     return 1;
@@ -1108,8 +1192,13 @@ int kis_database_logfile::log_packet(const kis_packet* in_pack) {
 int kis_database_logfile::log_data(const kis_gps_packinfo* gps,
         const kis_layer1_packinfo *l1info,
         const struct timeval& tv, const std::string& phystring, const mac_addr& devmac,
-        const uuid& datasource_uuid, const std::string& type, const std::string& json) {
+        const uuid& datasource_uuid, const std::string& type, const std::string& json,
+        const kis_gps_packinfo *reported_gps) {
 
+    if (!db_enabled)
+        return 0;
+
+    db_writer_guard writer_lk(this);
     if (!db_enabled)
         return 0;
 
@@ -1126,9 +1215,10 @@ int kis_database_logfile::log_data(const kis_gps_packinfo* gps,
         "(ts_sec, ts_usec, "
         "phyname, devmac, "
         "lat, lon, alt, speed, heading, "
+        "reported_lat, reported_lon, reported_alt, reported_speed, reported_heading, "
         "datasource, "
         "type, json, signal) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
     r = sqlite3_prepare(db, sql.c_str(), sql.length(), &data_stmt, &data_pz);
 
@@ -1150,26 +1240,15 @@ int kis_database_logfile::log_data(const kis_gps_packinfo* gps,
     sqlite3_bind_text(data_stmt, sql_pos++, phystring.c_str(), phystring.length(), SQLITE_TRANSIENT);
     sqlite3_bind_text(data_stmt, sql_pos++, macstring.c_str(), macstring.length(), SQLITE_TRANSIENT);
 
-    if (gps != NULL) {
-        sqlite3_bind_double(data_stmt, sql_pos++, gps->lat);
-        sqlite3_bind_double(data_stmt, sql_pos++, gps->lon);
-        sqlite3_bind_double(data_stmt, sql_pos++, gps->alt);
-        sqlite3_bind_double(data_stmt, sql_pos++, gps->speed);
-        sqlite3_bind_double(data_stmt, sql_pos++, gps->heading);
-    } else {
-        sqlite3_bind_double(data_stmt, sql_pos++, 0);
-        sqlite3_bind_double(data_stmt, sql_pos++, 0);
-        sqlite3_bind_double(data_stmt, sql_pos++, 0);
-        sqlite3_bind_double(data_stmt, sql_pos++, 0);
-        sqlite3_bind_double(data_stmt, sql_pos++, 0);
-    }
+    bind_gps(data_stmt, sql_pos, gps);
+    bind_gps(data_stmt, sql_pos, reported_gps);
 
     sqlite3_bind_text(data_stmt, sql_pos++, uuidstring.c_str(), uuidstring.length(), SQLITE_TRANSIENT);
 
     sqlite3_bind_text(data_stmt, sql_pos++, type.data(), type.length(), SQLITE_TRANSIENT);
     sqlite3_bind_text(data_stmt, sql_pos++, json.data(), json.length(), SQLITE_TRANSIENT);
 
-    if (l1info != nullptr) {
+    if (l1info != nullptr && l1info->data_ok) {
         sqlite3_bind_int(data_stmt, sql_pos++, l1info->signal_dbm);
     } else {
         sqlite3_bind_int(data_stmt, sql_pos++, 0);
@@ -1209,6 +1288,10 @@ int kis_database_logfile::log_datasources(const shared_tracker_element& in_datas
 }
 
 int kis_database_logfile::log_datasource(const shared_tracker_element& in_datasource) {
+    if (!db_enabled)
+        return 0;
+
+    db_writer_guard writer_lk(this);
     if (!db_enabled)
         return 0;
 
@@ -1275,6 +1358,10 @@ int kis_database_logfile::log_datasource(const shared_tracker_element& in_dataso
 }
 
 int kis_database_logfile::log_alert(const std::shared_ptr<tracked_alert>& in_alert) {
+    if (!db_enabled)
+        return 0;
+
+    db_writer_guard writer_lk(this);
     if (!db_enabled)
         return 0;
 
@@ -1351,6 +1438,10 @@ int kis_database_logfile::log_alert(const std::shared_ptr<tracked_alert>& in_ale
 int kis_database_logfile::log_snapshot(const std::shared_ptr<kis_gps_packinfo>& gps, struct timeval tv,
         const std::string& snaptype, const std::string& json) {
 
+    if (!db_enabled)
+        return 0;
+
+    db_writer_guard writer_lk(this);
     if (!db_enabled)
         return 0;
 
@@ -1564,6 +1655,13 @@ void kis_database_logfile::packet_drop_endpoint_handler(std::shared_ptr<kis_net_
         return;
     }
 
+    db_writer_guard writer_lk(this);
+    if (!db_enabled) {
+        con->set_status(400);
+        ostream << "Illegal request: kismetdb log not enabled\n";
+        return;
+    }
+
         auto drop_query =
             _DELETE(db, "packets", _WHERE("ts_sec", LE, con->json()["drop_before"].get<uint64_t>()));
 
@@ -1597,7 +1695,57 @@ void kis_database_logfile::make_poi_endp_handler(std::shared_ptr<kis_net_beast_h
 
 std::shared_ptr<tracker_element>
 kis_database_logfile::list_poi_endp_handler(std::shared_ptr<kis_net_beast_httpd_connection> con) {
-    return std::make_shared<tracker_element_vector>();
+    auto ret = std::make_shared<tracker_element_vector>();
+
+    if (!db_enabled)
+        return ret;
+
+    db_writer_guard writer_lk(this);
+    if (!db_enabled)
+        return ret;
+
+    // POIs are stored as snapshots by make_poi_endp_handler(); same connection as the writers,
+    // so this also sees POIs in the open transaction
+    const std::string sql =
+        "SELECT ts_sec, ts_usec, lat, lon, json FROM snapshots "
+        "WHERE snaptype = 'POI' ORDER BY ts_sec, ts_usec";
+
+    sqlite3_stmt *poi_stmt;
+    const char *poi_pz;
+
+    if (sqlite3_prepare(db, sql.c_str(), sql.length(), &poi_stmt, &poi_pz) != SQLITE_OK) {
+        _MSG_ERROR("kis_database_logfile unable to query POIs in {}: {}", ds_dbfile, sqlite3_errmsg(db));
+        return ret;
+    }
+
+    while (sqlite3_step(poi_stmt) == SQLITE_ROW) {
+        auto poi = std::make_shared<tracker_element_map>(poi_entry_id);
+
+        poi->insert(std::make_shared<tracker_element_uint64>(poi_ts_sec_id,
+                    sqlite3_column_int64(poi_stmt, 0)));
+        poi->insert(std::make_shared<tracker_element_uint64>(poi_ts_usec_id,
+                    sqlite3_column_int64(poi_stmt, 1)));
+        poi->insert(std::make_shared<tracker_element_double>(poi_lat_id,
+                    sqlite3_column_double(poi_stmt, 2)));
+        poi->insert(std::make_shared<tracker_element_double>(poi_lon_id,
+                    sqlite3_column_double(poi_stmt, 3)));
+
+        // The record is {"note": "..."}, or empty when the POI was created without a note
+        std::string note;
+        auto json_txt = reinterpret_cast<const char *>(sqlite3_column_text(poi_stmt, 4));
+        if (json_txt != nullptr) {
+            auto j = nlohmann::json::parse(json_txt, nullptr, false);
+            if (j.is_object() && j["note"].is_string())
+                note = j["note"].get<std::string>();
+        }
+        poi->insert(std::make_shared<tracker_element_string>(poi_note_id, note));
+
+        ret->push_back(poi);
+    }
+
+    sqlite3_finalize(poi_stmt);
+
+    return ret;
 }
 
 pcapng_stream_database::pcapng_stream_database(future_chainbuf* buffer) :

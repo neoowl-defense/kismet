@@ -23,6 +23,7 @@
 #include "version.h"
 
 #include "backward_wrapper.h"
+#include "console_tui.h"
 
 #include <cstdlib>
 #include <exception>
@@ -55,6 +56,7 @@
 #include "kis_dlt_ppi.h"
 #include "kis_dlt_radiotap.h"
 #include "kis_dlt_btle_radio.h"
+#include "kis_dlt_loratap.h"
 
 #include "kis_dissector_ipdata.h"
 
@@ -62,6 +64,7 @@
 #include "antennatracker.h"
 #include "kis_datasource.h"
 #include "datasourcetracker.h"
+
 #include "datasource_pcapfile.h"
 #include "datasource_kismetdb.h"
 #include "datasource_linux_wifi.h"
@@ -71,7 +74,9 @@
 #include "datasource_rtl433.h"
 #include "datasource_rtlamr.h"
 #include "datasource_rtladsb.h"
+#include "datasource_rtlais.h"
 #include "datasource_freaklabs_zigbee.h"
+#include "datasource_zigbee900.h"
 #include "datasource_nrf_mousejack.h"
 #include "datasource_ti_cc_2540.h"
 #include "datasource_nrf_51822.h"
@@ -84,15 +89,18 @@
 #include "datasource_dot11_scan.h"
 #include "datasource_bluetooth_scan.h"
 #include "datasource_bladerf_wiphy.h"
-#include "datasource_adsbproxy.h"
 #include "datasource_bt_geiger.h"
 #include "datasource_hak5_wifi_coconut.h"
+#include "datasource_usbwifi.h"
+#include "datasource_mm8108.h"
 #include "datasource_mqtt.h"
 #include "datasource_radview.h"
 #include "datasource_radiacode.h"
 #include "datasource_antsdr_droneid.h"
 #include "datasource_catsniffer_zigbee.h"
+#include "datasource_sniffle_ble.h"
 #include "datasource_wch_ble_analyzer_pro.h"
+#include "datasource_lorapipe.h"
 
 #include "logtracker.h"
 #include "kis_ppilogfile.h"
@@ -107,7 +115,6 @@
 #include "kis_net_beast_httpd.h"
 
 #include "system_monitor.h"
-#include "channeltracker2.h"
 #include "channeltracker_v3.h"
 #include "kis_httpd_registry.h"
 #include "messagebus_restclient.h"
@@ -117,17 +124,22 @@
 #include "gpstracker.h"
 
 #include "devicetracker.h"
+
 #include "phy_80211.h"
-#include "phy_sensor.h"
-#include "phy_meter.h"
-#include "phy_adsb.h"
-#include "phy_zwave.h"
-#include "phy_bluetooth.h"
-#include "phy_uav_drone.h"
-#include "phy_nrf_mousejack.h"
-#include "phy_btle.h"
 #include "phy_802154.h"
+#include "phy_adsb.h"
+#include "phy_ais.h"
+#include "phy_bluetooth.h"
+#include "phy_btle.h"
+#include "phy_meter.h"
+#include "phy_nrf_mousejack.h"
+#include "phy_ant.h"
+#include "phy_meshtastic.h"
+#include "phy_meshcore.h"
 #include "phy_radiation.h"
+#include "phy_sensor.h"
+#include "phy_uav_drone.h"
+#include "phy_zwave.h"
 
 #include "ipctracker_v2.h"
 #include "manuf.h"
@@ -179,6 +191,9 @@ int packnum = 0, localdropnum = 0;
 global_registry *globalregistry = NULL;
 
 void SpindownKismet() {
+    // Give the terminal back before the shutdown messages
+    console_tui::stop();
+
 	// Spin down streams
 	auto streamtracker = Globalreg::fetch_global_as<stream_tracker>();
 	if (streamtracker != nullptr)
@@ -232,12 +247,6 @@ void SpindownKismet() {
                 "\n");
 
         fprintf(stderr, "Kismet exiting.\n");
-
-        if (wrapper) {
-            // save cursor position, delete banner and restore cursor position
-            std::string clear_banner = "\u001b[s\u001b[H\u001b[2K\u001b[u";
-            printf("%s\n", clear_banner.c_str());
-        }
     }
 
     globalregistry->delete_lifetime_globals();
@@ -265,6 +274,8 @@ int usage(char *argv) {
            "     --no-console-wrapper     Disable server console wrapper\n"
            "     --no-ncurses-wrapper     Disable server console wrapper\n"
            "     --no-ncurses             Disable server console wrapper\n"
+           "     --enable-ncurses         Enable the server console wrapper even if\n"
+           "                              enable_ncurses=false in the config\n"
            "     --debug                  Disable the console wrapper and the crash\n"
            "                              handling functions, for debugging\n"
            " -c <datasource>              Use the specified datasource\n"
@@ -428,10 +439,16 @@ int main(int argc, char *argv[], char *envp[]) {
 
     bool debug_mode = false;
 
+    // Console wrapper from the command line; -1 follows enable_ncurses in the config.
+    // Debug and daemon mode always disable it.
+    int cli_wrapper = -1;
+    bool wrapper_forced_off = false;
+
     static struct option wrapper_longopt[] = {
         { "no-ncurses-wrapper", no_argument, 0, 'w' },
         { "no-console-wrapper", no_argument, 0, 'w' },
         { "no-ncurses", no_argument, 0, 'w' },
+        { "enable-ncurses", no_argument, 0, 'e' },
         { "daemonize", no_argument, 0, 'D' },
         { "debug", no_argument, 0, 'd' },
         { 0, 0, 0, 0 }
@@ -447,16 +464,20 @@ int main(int argc, char *argv[], char *envp[]) {
         if (r < 0) break;
 
         if (r == 'w') {
-            wrapper = false; 
-            glob_linewrap = false;
+            cli_wrapper = 0;
+        } else if (r == 'e') {
+            cli_wrapper = 1;
         } else if (r == 'd') {
             debug_mode = true;
-            wrapper = false;
-            glob_linewrap = false;
+            wrapper_forced_off = true;
         } else if (r == 'D') {
-            wrapper = false;
-            glob_linewrap = false;
+            wrapper_forced_off = true;
         }
+    }
+
+    if (wrapper_forced_off || cli_wrapper == 0) {
+        wrapper = false;
+        glob_linewrap = false;
     }
 
     optind = 0;
@@ -505,9 +526,6 @@ int main(int argc, char *argv[], char *envp[]) {
 
     // Set thread mask for all new threads
     pthread_sigmask(SIG_BLOCK, &core_signal_mask, nullptr);
-
-    // Launch signal catching thread that bypasses the block
-    Globalreg::globalreg->signal_service_thread = std::thread(signal_thread_handler);
 
     // Fill in base globalreg elements
     globalregistry->version_major = VERSION_MAJOR;
@@ -603,6 +621,11 @@ int main(int argc, char *argv[], char *envp[]) {
         }
     }
 
+    // Launch signal catching thread that bypasses the block.  This has to happen after
+    // daemonizing: fork() only copies the calling thread, so a thread started before it
+    // doesn't exist in the daemon, which then never sees SIGTERM, SIGINT or SIGHUP
+    Globalreg::globalreg->signal_service_thread = std::thread(signal_thread_handler);
+
     // Entrytracker needs to be allocated before almost everything else, anything which
     // handles serializable data needs it
     auto entrytracker = entry_tracker::create_entrytracker();
@@ -640,7 +663,10 @@ int main(int argc, char *argv[], char *envp[]) {
                         fatal_msg_queue.pop_front();
                     }
 
-                if (glob_silent)
+                // The console display shows messages itself once it's running
+                console_tui::add_message(msg->get_flags(), msg->get_message());
+
+                if (glob_silent || console_tui::active())
                     return;
 
                 if ((msg->get_flags() & MSGFLAG_DEBUG)) {
@@ -719,6 +745,13 @@ int main(int argc, char *argv[], char *envp[]) {
     }
     globalregistry->kismet_config = conf;
 
+    // The config can disable the console wrapper unless the command line picked; this
+    // has to be read before the wrapper changes the screen
+    if (wrapper && cli_wrapper < 0 && !conf->fetch_opt_bool("enable_ncurses", true)) {
+        wrapper = false;
+        glob_linewrap = false;
+    }
+
     struct stat fstat;
     std::string configdir;
 
@@ -747,17 +780,9 @@ int main(int argc, char *argv[], char *envp[]) {
         SpindownKismet();
     }
 
-    // Set a terminal margin via raw ncurses code
-    if (wrapper) {
-        // Direct ansi calls to set the top margin and invert colors
-        std::string banner_ansi = "\u001b[2J\u001b[2;r\u001b[1m\u001b[7m";
-        std::string banner = "KISMET - Point your browser to http://localhost:2501 (or the address of this system) "
-            "for the Kismet UI";
-        std::string banner_tail_ansi = "\u001b[0m";
-
-        // Print the banner and ascii tail to set a top margin
-        printf("%s%s%s\n", banner_ansi.c_str(), banner.c_str(), banner_tail_ansi.c_str());
-    }
+    // The console status display, on a terminal
+    if (wrapper && !daemonize)
+        console_tui::start();
 
     Load_Kismet_UUID(globalregistry);
 
@@ -893,6 +918,7 @@ int main(int argc, char *argv[], char *envp[]) {
     kis_dlt_ppi::create_dlt();
     kis_dlt_radiotap::create_dlt();
     kis_dlt_btle_radio::create_dlt();
+    kis_dlt_loratap::create_dlt();
 
     auto ipdissector = kis_dissector_ip_data::create_dissector_ip_data();
 
@@ -906,8 +932,12 @@ int main(int argc, char *argv[], char *envp[]) {
     devicetracker->register_phy_handler(dynamic_cast<kis_phy_handler *>(new kis_btle_phy()));
     devicetracker->register_phy_handler(dynamic_cast<kis_phy_handler *>(new kis_meter_phy()));
     devicetracker->register_phy_handler(dynamic_cast<kis_phy_handler *>(new kis_adsb_phy()));
+    devicetracker->register_phy_handler(dynamic_cast<kis_phy_handler *>(new kis_ais_phy()));
     devicetracker->register_phy_handler(dynamic_cast<kis_phy_handler *>(new kis_802154_phy()));
     devicetracker->register_phy_handler(dynamic_cast<kis_phy_handler *>(new kis_radiation_phy()));
+    devicetracker->register_phy_handler(dynamic_cast<kis_phy_handler *>(new kis_meshtastic_phy()));
+    devicetracker->register_phy_handler(dynamic_cast<kis_phy_handler *>(new kis_meshcore_phy()));
+    devicetracker->register_phy_handler(dynamic_cast<kis_phy_handler *>(new kis_ant_phy()));
 
     if (globalregistry->fatal_condition) 
         SpindownKismet();
@@ -922,7 +952,9 @@ int main(int argc, char *argv[], char *envp[]) {
     datasourcetracker->register_datasource(shared_datasource_builder(new datasource_rtl433_builder()));
     datasourcetracker->register_datasource(shared_datasource_builder(new datasource_rtlamr_builder()));
     datasourcetracker->register_datasource(shared_datasource_builder(new datasource_rtladsb_builder()));
+    datasourcetracker->register_datasource(shared_datasource_builder(new datasource_rtlais_builder()));
     datasourcetracker->register_datasource(shared_datasource_builder(new datasource_freaklabs_zigbee_builder()));
+    datasourcetracker->register_datasource(shared_datasource_builder(new datasource_zigbee900_builder()));
     datasourcetracker->register_datasource(shared_datasource_builder(new datasource_nrf_mousejack_builder()));
     datasourcetracker->register_datasource(shared_datasource_builder(new datasource_ticc2540_builder()));
     datasourcetracker->register_datasource(shared_datasource_builder(new datasource_nrf51822_builder()));
@@ -932,15 +964,18 @@ int main(int argc, char *argv[], char *envp[]) {
     datasourcetracker->register_datasource(shared_datasource_builder(new datasource_rzkillerbee_builder()));
     datasourcetracker->register_datasource(shared_datasource_builder(new datasource_ticc2531_builder()));
     datasourcetracker->register_datasource(shared_datasource_builder(new datasource_bladerf_wiphy_builder()));
-    datasourcetracker->register_datasource(shared_datasource_builder(new datasource_adsbproxy_builder()));
     datasourcetracker->register_datasource(shared_datasource_builder(new datasource_bt_geiger_builder()));
     datasourcetracker->register_datasource(shared_datasource_builder(new datasource_hak5_wifi_coconut_builder()));
+    datasourcetracker->register_datasource(shared_datasource_builder(new datasource_usbwifi_builder()));
+    datasourcetracker->register_datasource(shared_datasource_builder(new datasource_mm8108_builder()));
     datasourcetracker->register_datasource(shared_datasource_builder(new datasource_mqtt_builder()));
     datasourcetracker->register_datasource(shared_datasource_builder(new datasource_radview_builder()));
     datasourcetracker->register_datasource(shared_datasource_builder(new datasource_radiacode_usb_builder()));
     datasourcetracker->register_datasource(shared_datasource_builder(new datasource_antsdr_droneid_builder()));
     datasourcetracker->register_datasource(shared_datasource_builder(new datasource_catsniffer_zigbee_builder()));
+    datasourcetracker->register_datasource(shared_datasource_builder(new datasource_sniffle_ble_builder()));
     datasourcetracker->register_datasource(shared_datasource_builder(new datasource_wch_ble_pro_builder()));
+    datasourcetracker->register_datasource(shared_datasource_builder(new datasource_lorapipe_builder()));
 
     // Virtual sources get a special meta-builder
     datasource_virtual_builder::create_virtualbuilder();
@@ -992,11 +1027,6 @@ int main(int argc, char *argv[], char *envp[]) {
 
     // Set the global silence now that we're set up
     glob_silent = local_silent;
-
-    // finalize any plugins which were waiting for other code to load
-    if (plugintracker != nullptr) {
-        plugintracker->finalize_plugins();
-    }
 
     // Load alerts from the config
     auto config_alerts = Globalreg::globalreg->kismet_config->fetch_opt_vec("load_alert");
@@ -1064,7 +1094,13 @@ int main(int argc, char *argv[], char *envp[]) {
                     "are built against the same version of Kismet.");
             SpindownKismet();
         }
+
+        // finalize any plugins which were waiting for other code to load
+        plugintracker->finalize_plugins();
     }
+
+    // Open the configured sources only now, so a source can use a type a plugin registered
+    Globalreg::fetch_mandatory_global_as<datasource_tracker>()->launch_configured_sources();
 
 
     while (true) {

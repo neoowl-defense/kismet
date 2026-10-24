@@ -28,15 +28,12 @@
 #include <fmt_asio.h>
 
 kis_gps_tcp_v2::kis_gps_tcp_v2(shared_gps_builder in_builder, uint64_t in_id) :
-    kis_gps_nmea_v2{in_builder, in_id},
+    kis_gps_nmea_v3{in_builder, in_id},
 	resolver{Globalreg::globalreg->io},
 	socket{Globalreg::globalreg->io} {
 
     // Defer making buffers until open, because we might be used to make a 
     // builder instance
-
-    ever_seen_gps = false;
-    last_heading_time = time(0);
 
     auto timetracker = 
         Globalreg::fetch_mandatory_global_as<time_tracker>("TIMETRACKER");
@@ -44,6 +41,9 @@ kis_gps_tcp_v2::kis_gps_tcp_v2(shared_gps_builder in_builder, uint64_t in_id) :
     error_reconnect_timer = 
         timetracker->register_timer(SERVER_TIMESLICES_SEC * 10, NULL, 1,
                 [this](int) -> int {
+                    // Serialized with the data timeout timer, which can also reopen the GPS
+                    kis_lock_guard<kis_mutex> lk(gps_mutex, "reconnect timer");
+
                     if (get_device_connected()) 
                         return 1;
 
@@ -55,6 +55,7 @@ kis_gps_tcp_v2::kis_gps_tcp_v2(shared_gps_builder in_builder, uint64_t in_id) :
     data_timeout_timer =
         timetracker->register_timer(SERVER_TIMESLICES_SEC * 10, NULL, 1,
                 [this](int) -> int {
+                kis_lock_guard<kis_mutex> lk(gps_mutex, "data timer");
 
                 if (socket.is_open() && time(0) - last_data_time > 30) {
                     close();
@@ -91,7 +92,8 @@ void kis_gps_tcp_v2::close() {
                 self->close_impl();
             }));
 
-    ft.wait();
+    // If the IO threads aren't running (a fatal error during startup) don't hang shutdown
+    ft.wait_for(std::chrono::seconds(2));
 }
 void kis_gps_tcp_v2::close_impl() {
     stopped = true;
@@ -106,6 +108,11 @@ void kis_gps_tcp_v2::close_impl() {
             ;
         }
     }
+
+    // Don't splice a partial line onto the next connection
+    in_buf.consume(in_buf.size());
+    gsv.reset();
+    clear_quality();
 }
 
 void kis_gps_tcp_v2::start_read_impl() {
@@ -178,12 +185,12 @@ bool kis_gps_tcp_v2::open_gps(std::string in_opts) {
 
     if (proto_host == "") {
         _MSG("(GPS) Expected a host= option for TCP GPS, none found.", MSGFLAG_ERROR);
-        return -1;
+        return false;
     }
 
     if (proto_port == "") {
         _MSG_INFO("(GPS) Expected a port= option for TCP GPS, none found.", MSGFLAG_ERROR);
-        return -1;
+        return false;
     }
 
     host = proto_host;
@@ -203,7 +210,7 @@ bool kis_gps_tcp_v2::open_gps(std::string in_opts) {
                 boost::asio::placeholders::error,
                 boost::asio::placeholders::results));
 
-    return 1;
+    return true;
 }
 
 bool kis_gps_tcp_v2::get_location_valid() {

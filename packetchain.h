@@ -37,6 +37,7 @@
 #include <functional>
 #include <queue>
 #include <thread>
+#include <unordered_set>
 
 #include "eventbus.h"
 #include "globalregistry.h"
@@ -48,7 +49,8 @@
 #include "trackedelement.h"
 #include "trackedrrd.h"
 
-#include "moodycamel/blockingconcurrentqueue.h"
+#include <condition_variable>
+#include <deque>
 
 /*
  * Packets are captured (typically from an IO thread, either for ASIO IPC and TCP or
@@ -102,6 +104,65 @@
     const std::shared_ptr<kis_packet>& in_pack
 
 class kis_packet;
+class kis_datachunk;
+
+// Handoff queue to one packet thread.  Packets come out in the order they were queued,
+// whichever threads queued them, so a source's packets are processed in capture order.
+class packet_fifo {
+public:
+    void enqueue(std::shared_ptr<kis_packet> in_pack) {
+        bool wake;
+
+        pending.fetch_add(1, std::memory_order_relaxed);
+
+        {
+            std::lock_guard<std::mutex> lk(mutex);
+            queue.push_back(std::move(in_pack));
+            wake = waiting;
+        }
+
+        if (wake)
+            cv.notify_one();
+    }
+
+    // Move everything queued into an empty out, in order; false if nothing was queued
+    bool try_dequeue_all(std::deque<std::shared_ptr<kis_packet>>& out) {
+        std::lock_guard<std::mutex> lk(mutex);
+
+        if (queue.empty())
+            return false;
+
+        std::swap(out, queue);
+        return true;
+    }
+
+    void wait_dequeue_all(std::deque<std::shared_ptr<kis_packet>>& out) {
+        std::unique_lock<std::mutex> lk(mutex);
+
+        waiting = true;
+        cv.wait(lk, [this]() { return !queue.empty(); });
+        waiting = false;
+
+        std::swap(out, queue);
+    }
+
+    // The consumer finished a dequeued packet
+    void packet_done() {
+        pending.fetch_sub(1, std::memory_order_relaxed);
+    }
+
+    // Packets queued or dequeued and not yet finished
+    size_t size_approx() const {
+        return pending.load(std::memory_order_relaxed);
+    }
+
+protected:
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<std::shared_ptr<kis_packet>> queue;
+    bool waiting = false;
+    std::atomic<size_t> pending{0};
+};
 
 class packet_chain : public lifetime_global {
 public:
@@ -176,7 +237,7 @@ public:
     }
 
 protected:
-    void packet_queue_processor(moodycamel::BlockingConcurrentQueue<std::shared_ptr<kis_packet>> *packet_queue);
+    void packet_queue_processor(packet_fifo *packet_queue);
 
     // Common function for both insertion methods
     int register_int_handler(pc_callback in_cb, void *in_aux, int in_chain, int in_prio);
@@ -186,31 +247,63 @@ protected:
     std::unordered_map<std::string, int> component_str_map;
     std::map<int, std::string> component_id_map;
 
-    // Core chain components
-    std::vector<packet_chain::pc_link*> postcap_chain;
-    std::vector<packet_chain::pc_link*> llcdissect_chain;
-    std::vector<packet_chain::pc_link*> decrypt_chain;
-    std::vector<packet_chain::pc_link*> datadissect_chain;
-    std::vector<packet_chain::pc_link*> classifier_chain;
-	std::vector<packet_chain::pc_link*> tracker_chain;
-    std::vector<packet_chain::pc_link*> logging_chain;
+    // All handler chains.  A snapshot is never modified once it is published; registering or
+    // removing a handler publishes a new one.  Threads running packets keep a reference to the
+    // snapshot they are using, so a removed link stays valid until they are done with it.
+    struct pc_chains {
+        uint64_t generation = 0;
 
-    // Updated chain components
-    std::vector<packet_chain::pc_link*> postcap_chain_new;
-    std::vector<packet_chain::pc_link*> llcdissect_chain_new;
-    std::vector<packet_chain::pc_link*> decrypt_chain_new;
-    std::vector<packet_chain::pc_link*> datadissect_chain_new;
-    std::vector<packet_chain::pc_link*> classifier_chain_new;
-	std::vector<packet_chain::pc_link*> tracker_chain_new;
-    std::vector<packet_chain::pc_link*> logging_chain_new;
+        std::vector<pc_link> postcap;
+        std::vector<pc_link> llcdissect;
+        std::vector<pc_link> decrypt;
+        std::vector<pc_link> datadissect;
+        std::vector<pc_link> classifier;
+        std::vector<pc_link> tracker;
+        std::vector<pc_link> logging;
+    };
 
-    bool postcap_chain_update;
-    bool llcdissect_chain_update;
-    bool decrypt_chain_update;
-    bool datadissect_chain_update;
-    bool classifier_chain_update;
-    bool tracker_chain_update;
-    bool logging_chain_update;
+    using pc_chains_ptr = std::shared_ptr<const pc_chains>;
+
+    // Reference to a chain snapshot held by the current thread; remove_handler() does not
+    // wait for snapshots held by the calling thread itself
+    class pc_chains_ref {
+    public:
+        pc_chains_ref() = default;
+        pc_chains_ref(const pc_chains_ref&) = delete;
+        pc_chains_ref& operator=(const pc_chains_ref&) = delete;
+        ~pc_chains_ref() { reset(); }
+
+        void set(pc_chains_ptr in_chains);
+        void reset();
+
+        const pc_chains *get() const { return chains.get(); }
+        const pc_chains *operator->() const { return chains.get(); }
+
+    private:
+        pc_chains_ptr chains;
+    };
+
+    // Current snapshot, protected by packetchain_mutex
+    pc_chains_ptr chains;
+    // Generation of the current snapshot, so packet threads can check it without locking
+    std::atomic<uint64_t> chains_generation;
+
+    pc_chains_ptr fetch_chains();
+    static std::vector<pc_link> *select_chain(pc_chains *in_chains, int in_chain);
+
+    // Publish a new snapshot; must hold packetchain_mutex
+    void publish_chains(std::shared_ptr<pc_chains> in_chains);
+
+    int remove_int_handler(const std::function<bool (const pc_link&)>& in_match, int in_chain);
+
+    // Wait until no other thread is still running a replaced snapshot
+    void wait_for_retired_chains();
+
+    std::mutex retired_mutex;
+    // Replaced snapshots which may still be in use
+    std::vector<std::weak_ptr<const pc_chains>> retired_chains;
+    // Snapshots held by threads currently waiting in remove_handler()
+    std::unordered_multiset<const void *> waiting_chains;
 
     // Packet component mutex
     mutable kis_shared_mutex packetcomp_mutex;
@@ -220,7 +313,7 @@ protected:
 
     struct packet_thread {
         std::thread packet_thread;
-        moodycamel::BlockingConcurrentQueue<std::shared_ptr<kis_packet>> packet_queue;
+        packet_fifo packet_queue;
     };
 
     packet_thread **packet_threads;
@@ -266,31 +359,61 @@ protected:
 
     ankerl::unordered_dense::map<size_t, std::shared_ptr<void>> component_pool_map;
 
-    // Unique lock for packet number and dedupe
-    kis_shared_mutex pack_no_mutex;
-
     // Next unique packet number
     std::atomic<uint64_t> unique_packet_no;
 
-    // A simple array of hash to packet ID for the past 1024 unique packets
-    typedef struct packno_map {
-        packno_map() {
-            hash = 0;
-            packno = 0;
-        }
+    // Next arrival number
+    std::atomic<uint64_t> arrival_packet_no;
 
-        uint32_t hash;
-        uint64_t packno;
-        std::shared_ptr<kis_packet> original_pkt;
-    } packno_map_t;
+    // Recent unique packets per window for duplicate detection; matches are limited to
+    // packets which arrived within this many packets of each other
+    static constexpr size_t dedupe_list_sz = 1024;
 
-    std::array<packno_map_t, 1024> dedupe_list;
-    // packno_map_t dedupe_list[1024];
+    // A packet goes to its assigned thread unless that thread is this far behind, then to
+    // its key's alternate thread if that one is less busy
+    static constexpr size_t assignment_spill_backlog = 1024;
 
-    // Current position in the dedupe list
-    std::atomic<unsigned int> dedupe_list_pos;
+public:
+    // A packet thread is far enough behind that capture readers should pause, so a source
+    // faster than processing (such as a pcap replay) is slowed down instead of dropped
+    bool backlog_high() const;
 
-	int pack_comp_linkframe, pack_comp_decap, pack_comp_l1_agg, pack_comp_l1, pack_comp_datasource;
+    // Readers pause above this backlog per thread, or half the drop limit if lower
+    static constexpr size_t reader_pause_backlog = 4096;
+
+protected:
+    // Identical frames get the same assignment id, so each assignment slot keeps its own
+    // duplicate window and lock; a packet spilled to another thread still checks its slot's
+    // window.  Hashes are kept apart from the packets so the scan reads contiguous memory;
+    // a null packet marks an empty slot.
+    struct dedupe_window {
+        std::mutex mutex;
+
+        // Window load follows the assignment keys, so a busy window covers less time than
+        // a quiet one; the arrival bound keeps the lookback the same for every window
+        std::array<uint32_t, dedupe_list_sz> hash{};
+        std::array<uint64_t, dedupe_list_sz> arrival_no{};
+        std::array<std::shared_ptr<kis_packet>, dedupe_list_sz> pkt;
+
+        // Next slot to fill
+        size_t pos = 0;
+
+        // Packets which matched a hash and are still being compared; they're visible to the
+        // dedupe scan but don't occupy the window until confirmed as originals
+        std::vector<std::shared_ptr<kis_packet>> pending;
+    };
+
+    std::unique_ptr<dedupe_window[]> dedupe_windows;
+
+    // Number the packet or alias it to an identical earlier packet
+    void dedupe_packet(const std::shared_ptr<kis_packet>& packet);
+
+    // Add an original to the window; caller holds the window lock.  Returns the evicted
+    // packet so it can be released after the lock is dropped.
+    std::shared_ptr<kis_packet> dedupe_insert(dedupe_window& window,
+            const std::shared_ptr<kis_packet>& packet);
+
+	int pack_comp_linkframe, pack_comp_decap, pack_comp_l1_agg, pack_comp_datasource;
 
 };
 

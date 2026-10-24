@@ -25,6 +25,7 @@
 #include "alertracker.h"
 #include "packetchain.h"
 #include "timetracker.h"
+#include <cmath>
 #include <future>
 
 // We never instantiate from a generic tracker component or from a stored
@@ -58,10 +59,7 @@ kis_datasource::kis_datasource(shared_datasource_builder in_builder) :
 
     pack_comp_report = packetchain->register_packet_component("PACKETREPORT");
 	pack_comp_linkframe = packetchain->register_packet_component("LINKFRAME");
-    pack_comp_l1info = packetchain->register_packet_component("RADIODATA");
     pack_comp_l1_agg = packetchain->register_packet_component("RADIODATA_AGG");
-    pack_comp_gps = packetchain->register_packet_component("GPS");
-    pack_comp_no_gps = packetchain->register_packet_component("NOGPS");
 	pack_comp_datasrc = packetchain->register_packet_component("KISDATASRC");
     pack_comp_json = packetchain->register_packet_component("JSON");
     pack_comp_protobuf = packetchain->register_packet_component("PROTOBUF");
@@ -90,7 +88,8 @@ kis_datasource::kis_datasource(shared_datasource_builder in_builder) :
 }
 
 kis_datasource::~kis_datasource() {
-    // Cancel any timer
+    // Wait out any running timer callback, they hold this; elsewhere timers are only
+    // cancelled since the callbacks take ext_mutex, which those callers hold
     timetracker->remove_timer(error_timer_id);
     timetracker->remove_timer(ping_timer_id);
 
@@ -323,7 +322,7 @@ void kis_datasource::open_interface(std::string in_definition, unsigned int in_t
 
     // If we have an error callback that's going to try to re-open us, cancel it
     if (error_timer_id > 0)
-        timetracker->remove_timer(error_timer_id);
+        timetracker->cancel_timer(error_timer_id);
 
     if (!launch_ipc()) {
         return;
@@ -338,8 +337,10 @@ void kis_datasource::open_interface(std::string in_definition, unsigned int in_t
         last_pong = (time_t) Globalreg::globalreg->last_tv_sec;
 
         // If we got here we're valid; start a PING timer
-        timetracker->remove_timer(ping_timer_id);
+        timetracker->cancel_timer(ping_timer_id);
         ping_timer_id = timetracker->register_timer(std::chrono::seconds(5), true, [this](int) -> int {
+                kis_lock_guard<kis_mutex> lk(ext_mutex, "datasource v2 ping_timer lambda");
+
                 if (!get_source_running()) {
                     ping_timer_id = -1;
                     return 0;
@@ -441,6 +442,21 @@ void kis_datasource::set_channel_hop(double in_rate,
         return;
     }
 
+    if (!std::isfinite(in_rate) || in_rate <= 0) {
+        if (in_cb != NULL) {
+            in_cb(in_transaction, false, "Invalid channel hop rate");
+        }
+        return;
+    }
+
+    auto max_rate = get_source_builder()->get_max_hop_rate();
+
+    if (max_rate > 0 && in_rate > max_rate) {
+        _MSG_INFO("Source '{}' requested channel hop rate {}/sec exceeds driver maximum, "
+                "using {}/sec", get_source_name(), in_rate, max_rate);
+        in_rate = max_rate;
+    }
+
     // Generate the command and send it
     send_configure_channel_hop(in_rate, in_chans, in_shuffle, in_offt,
             in_transaction, in_cb);
@@ -480,7 +496,7 @@ void kis_datasource::connect_remote(std::string in_definition, kis_datasource* i
 
     // Kill any error handlers
     if (error_timer_id > 0)
-        timetracker->remove_timer(error_timer_id);
+        timetracker->cancel_timer(error_timer_id);
 
     // Reset the state
     set_int_source_running(true);
@@ -518,7 +534,7 @@ void kis_datasource::connect_remote(std::string in_definition, kis_datasource* i
     last_pong = (time_t) Globalreg::globalreg->last_tv_sec;
 
     if (ping_timer_id > 0)
-        timetracker->remove_timer(ping_timer_id);
+        timetracker->cancel_timer(ping_timer_id);
 
     ping_timer_id = timetracker->register_timer(std::chrono::seconds(5), true, [this](int) -> int {
         kis_lock_guard<kis_mutex> lk(ext_mutex, "datasource ping_timer lambda");
@@ -558,8 +574,23 @@ void kis_datasource::connect_remote(std::string in_definition, kis_datasource* i
     send_open_source(get_source_definition(), 0, in_cb);
 }
 
+void kis_datasource::stop_source() {
+    kis_lock_guard<kis_mutex> lk(ext_mutex, "datasource stop_source");
+
+    set_int_source_retry(false);
+
+    if (error_timer_id > 0)
+        timetracker->cancel_timer(error_timer_id);
+
+    error_timer_id = -1;
+
+    close_source();
+}
+
 void kis_datasource::disable_source() {
     kis_lock_guard<kis_mutex> lk(ext_mutex, "datasource disable_source");
+
+    source_disabled = true;
 
     close_source();
 
@@ -570,7 +601,7 @@ void kis_datasource::disable_source() {
 
     // cancel any timers
     if (error_timer_id > 0)
-        timetracker->remove_timer(error_timer_id);
+        timetracker->cancel_timer(error_timer_id);
 
     error_timer_id = -1;
 }
@@ -659,7 +690,7 @@ void kis_datasource::close_external_impl() {
     kis_unique_lock<kis_mutex> lk(ext_mutex, "datasource close_external");
 
     if (ping_timer_id > 0) {
-        timetracker->remove_timer(ping_timer_id);
+        timetracker->cancel_timer(ping_timer_id);
         ping_timer_id = -1;
     }
 
@@ -729,6 +760,24 @@ double kis_datasource::get_definition_opt_double(std::string in_opt, double in_d
     ss >> d;
 
     return d;
+}
+
+namespace {
+    // Channel list options, split on commas with surrounding whitespace removed
+    std::vector<std::string> definition_channel_list(const std::string& in_list) {
+        std::vector<std::string> ret;
+
+        for (const auto& c : str_tokenize(in_list, ",")) {
+            const auto b = c.find_first_not_of(" \t");
+
+            if (b == std::string::npos)
+                continue;
+
+            ret.push_back(c.substr(b, c.find_last_not_of(" \t") - b + 1));
+        }
+
+        return ret;
+    }
 }
 
 bool kis_datasource::parse_source_definition(std::string in_definition) {
@@ -852,7 +901,12 @@ std::string kis_datasource::generate_source_definition() {
                 ss << ",";
             comma = true;
 
-            ss << o.first << "=" << o.second;
+            // Values with commas, such as channel lists, are quoted so the definition
+            // parses the same way when the source is re-opened
+            if (o.second.find(',') != std::string::npos)
+                ss << o.first << "=\"" << o.second << "\"";
+            else
+                ss << o.first << "=" << o.second;
         }
     }
 
@@ -895,7 +949,7 @@ void kis_datasource::cancel_command(uint32_t in_transaction, std::string in_erro
 
         // Cancel any timers
         if (cmd->timer_id > -1) {
-            timetracker->remove_timer(cmd->timer_id);
+            timetracker->cancel_timer(cmd->timer_id);
             cmd->timer_id = -1;
         }
 
@@ -965,19 +1019,17 @@ void kis_datasource::handle_rx_packet(std::shared_ptr<kis_packet> packet) {
 
     packet->insert(pack_comp_datasrc, datasrcinfo);
 
-    inc_source_num_packets(1);
+    // Counted as valid, error, filtered or dropped by the packet chain
     get_source_packet_rrd()->add_sample(1, Globalreg::globalreg->last_tv_sec);
 
     // Insert GPS data as soon as possible in the chain if there's no data
     // from the rest of the processing
-    if (packet->fetch(pack_comp_gps) == nullptr &&
-            packet->fetch(pack_comp_no_gps) == nullptr) {
-        auto gpsloc = gpstracker->get_best_location();
-
-        if (gpsloc != nullptr) {
-            packet->insert(pack_comp_gps, std::move(gpsloc));
-        }
-
+    if (!packet->gps_info.gps_info_ok && !packet->suppress_gps) {
+        // Virtual sources inject packets directly and never set the cached gpstracker
+        if (gpstracker != nullptr)
+            gpstracker->get_best_location(packet->gps_info);
+        else
+            Globalreg::fetch_mandatory_global_as<gps_tracker>()->get_best_location(packet->gps_info);
     }
 
     // Inject the packet into the packetchain if we have one
@@ -1773,7 +1825,7 @@ void kis_datasource::handle_packet_opensource_report_v3(uint32_t seqno, uint16_t
             }
 
             set_int_source_hop_rate(rate);
-            set_int_source_hop_rate(true);
+            set_int_source_hopping(true);
         } else {
             set_int_source_hopping(false);
         }
@@ -1855,7 +1907,7 @@ void kis_datasource::handle_packet_opensource_report_v3(uint32_t seqno, uint16_t
     // merge the custom channels list and the supplied channels list.  Otherwise,
     // copy the source list to the hop list.
     //
-    // if we have a 'channel=' in the source definition that isnt in the list, add it.
+    // if we have a 'channel=' in the source definition that isn't in the list, add it.
     //
     // if we havce an 'add_channels=' in the source, use the provided list + the
     // added list as the hop list
@@ -1869,7 +1921,8 @@ void kis_datasource::handle_packet_opensource_report_v3(uint32_t seqno, uint16_t
     source_hop_vec->clear();
 
     // add the channel= to the source channels list
-    const auto def_chan = get_definition_opt("channel");
+    const auto def_chan_v = definition_channel_list(get_definition_opt("channel"));
+    const auto def_chan = def_chan_v.empty() ? std::string{} : def_chan_v[0];
     if (def_chan != "") {
         string_vector_merge<std::vector<std::string>, tracker_element_vector_string>({def_chan}, source_channels_vec.get(),
                 [](const std::string& a, const std::string& b) -> bool {
@@ -1877,9 +1930,9 @@ void kis_datasource::handle_packet_opensource_report_v3(uint32_t seqno, uint16_t
                 });
     }
 
-    const std::vector<std::string> def_vec = str_tokenize(get_definition_opt("channels"), ",");
-    const std::vector<std::string> add_vec = str_tokenize(get_definition_opt("add_channels"), ",");
-    const std::vector<std::string> block_vec = str_tokenize(get_definition_opt("block_channels"), ",");
+    const std::vector<std::string> def_vec = definition_channel_list(get_definition_opt("channels"));
+    const std::vector<std::string> add_vec = definition_channel_list(get_definition_opt("add_channels"));
+    const std::vector<std::string> block_vec = definition_channel_list(get_definition_opt("block_channels"));
 
     // handle the channel list merge
 
@@ -1906,7 +1959,7 @@ void kis_datasource::handle_packet_opensource_report_v3(uint32_t seqno, uint16_t
         string_vector_inline_filter<tracker_element_vector_string, std::vector<std::string>>(source_channels_vec.get(),
                 block_vec,
                 [](const std::string& a, const std::string& b) -> bool {
-                    return strcasecmp(a.c_str(), b.c_str()) != 0;
+                    return strcasecmp(a.c_str(), b.c_str()) == 0;
                 });
 
         string_vector_merge<std::vector<std::string>, tracker_element_vector_string>(add_vec, source_channels_vec.get(),
@@ -1929,80 +1982,60 @@ void kis_datasource::handle_packet_opensource_report_v3(uint32_t seqno, uint16_t
     handle_opensource_report_v3_callback(report_seqno, code, lock, msg);
 }
 
-std::shared_ptr<kis_gps_packinfo> kis_datasource::handle_sub_gps(mpack_node_t& root,
-        mpack_tree_t *tree) {
+bool kis_datasource::handle_sub_gps(mpack_node_t& root, mpack_tree_t *tree,
+        kis_gps_packinfo& gpsinfo) {
     auto gpsmap = mpack_node_map_uint_optional(root, KIS_EXTERNAL_V3_KDS_DATAREPORT_FIELD_GPSBLOCK);
 
     if (mpack_node_is_missing(gpsmap)) {
-        return nullptr;
+        return false;
     }
 
     if (mpack_tree_error(tree) != mpack_ok) {
         _MSG_ERROR("Kismet datasource {} got malformed v3 DATAREPORT (gps block)", get_source_name());
         trigger_error("invalid v3 DATAREPORT");
-        return nullptr;
+        return false;
     }
-
-    auto gpsinfo = packetchain->new_packet_component<kis_gps_packinfo>();
 
     auto n = mpack_node_map_uint_optional(gpsmap, KIS_EXTERNAL_V3_KDS_SUB_GPS_FIELD_LAT);
     if (!mpack_node_is_missing(n)) {
-        gpsinfo->lat = mpack_node_double(n);
+        gpsinfo.lat = mpack_node_double(n);
     }
 
     n = mpack_node_map_uint_optional(gpsmap, KIS_EXTERNAL_V3_KDS_SUB_GPS_FIELD_LON);
     if (!mpack_node_is_missing(n)) {
-        gpsinfo->lon = mpack_node_double(n);
+        gpsinfo.lon = mpack_node_double(n);
     }
 
     n = mpack_node_map_uint_optional(gpsmap, KIS_EXTERNAL_V3_KDS_SUB_GPS_FIELD_ALT);
     if (!mpack_node_is_missing(n)) {
-        gpsinfo->alt = mpack_node_float(n);
+        gpsinfo.alt = mpack_node_float(n);
     }
 
     n = mpack_node_map_uint_optional(gpsmap, KIS_EXTERNAL_V3_KDS_SUB_GPS_FIELD_FIX);
     if (!mpack_node_is_missing(n)) {
-        gpsinfo->fix = mpack_node_u8(n);
+        gpsinfo.fix = mpack_node_u8(n);
     }
 
     n = mpack_node_map_uint_optional(gpsmap, KIS_EXTERNAL_V3_KDS_SUB_GPS_FIELD_SPEED);
     if (!mpack_node_is_missing(n)) {
-        gpsinfo->speed = mpack_node_float(n);
+        gpsinfo.speed = mpack_node_float(n);
     }
 
     n = mpack_node_map_uint_optional(gpsmap, KIS_EXTERNAL_V3_KDS_SUB_GPS_FIELD_HEADING);
     if (!mpack_node_is_missing(n)) {
-        gpsinfo->heading = mpack_node_float(n);
+        gpsinfo.heading = mpack_node_float(n);
     }
 
     n = mpack_node_map_uint_optional(gpsmap, KIS_EXTERNAL_V3_KDS_SUB_GPS_FIELD_PRECISION);
     if (!mpack_node_is_missing(n)) {
-        gpsinfo->precision = mpack_node_float(n);
+        gpsinfo.precision = mpack_node_float(n);
     }
 
     n = mpack_node_map_uint(gpsmap, KIS_EXTERNAL_V3_KDS_SUB_GPS_FIELD_TS_S);
-    gpsinfo->tv.tv_sec = mpack_node_u64(n);
+    gpsinfo.tv.tv_sec = mpack_node_u64(n);
 
     n = mpack_node_map_uint(gpsmap, KIS_EXTERNAL_V3_KDS_SUB_GPS_FIELD_TS_US);
-    gpsinfo->tv.tv_usec = mpack_node_u64(n);
-
-    /* GPS name deprecated
-    n = mpack_node_map_uint_optional(gpsmap, KIS_EXTERNAL_V3_KDS_SUB_GPS_FIELD_NAME);
-    if (!mpack_node_is_missing(n)) {
-        auto name_s = mpack_node_str(n);
-        auto name_sz = mpack_node_data_len(n);
-
-        gpsinfo->gpsname = std::string(name_s, name_sz);
-    }
-    */
-
-    /* type not currently used in packinfo
-    n = mpack_node_map_uint_optional(gpsmap, KIS_EXTERNAL_V3_KDS_SUB_GPS_FIELD_TYPE);
-    if (!mpack_node_is_missing(n)) {
-        auto type_s = mpack_node_str(n);
-        auto type_sz = mpack_node_data_len(n);
-    }
-    */
+    gpsinfo.tv.tv_usec = mpack_node_u64(n);
 
     n = mpack_node_map_uint_optional(gpsmap, KIS_EXTERNAL_V3_KDS_SUB_GPS_FIELD_UUID);
     if (!mpack_node_is_missing(n)) {
@@ -2013,7 +2046,7 @@ std::shared_ptr<kis_gps_packinfo> kis_datasource::handle_sub_gps(mpack_node_t& r
         uuid_v.from_string(std::string(uuid_s, uuid_sz));
         auto gps = gpstracker->find_gps(uuid_v);
         if (gps != nullptr) {
-            gpsinfo->gps_id = gps->get_id();
+            gpsinfo.gps_id = gps->get_id();
         }
     }
 
@@ -2021,57 +2054,59 @@ std::shared_ptr<kis_gps_packinfo> kis_datasource::handle_sub_gps(mpack_node_t& r
         _MSG_ERROR("Kismet datasource {} got malformed v3 DATAREPORT (gps block)",
                 get_source_name());
         trigger_error("invalid v3 DATAREPORT");
-        return nullptr;
+        return false;
     }
 
-    return gpsinfo;
+    gpsinfo.gps_info_ok = true;
+
+    return true;
 }
 
-std::shared_ptr<kis_layer1_packinfo> kis_datasource::handle_sub_signal(mpack_node_t& root,
-        mpack_tree_t *tree) {
+bool kis_datasource::handle_sub_signal(mpack_node_t& root, mpack_tree_t *tree,
+        kis_layer1_packinfo& siginfo) {
     if (!mpack_node_map_contains_uint(root, KIS_EXTERNAL_V3_KDS_DATAREPORT_FIELD_SIGNALBLOCK)) {
-        return nullptr;
+        return false;
     }
     auto sigmap = mpack_node_map_uint(root, KIS_EXTERNAL_V3_KDS_DATAREPORT_FIELD_SIGNALBLOCK);
 
     if (mpack_tree_error(tree) != mpack_ok) {
         _MSG_ERROR("Kismet datasource {} got malformed v3 DATAREPORT (signal block)", get_source_name());
         trigger_error("invalid v3 DATAREPORT");
-        return nullptr;
+        return false;
     }
 
-    auto siginfo = packetchain->new_packet_component<kis_layer1_packinfo>();
+    // auto siginfo = packetchain->new_packet_component<kis_layer1_packinfo>();
 
     auto s_dbm_n = mpack_node_map_uint_optional(sigmap, KIS_EXTERNAL_V3_KDS_SUB_SIGNAL_FIELD_SIGNAL_DBM);
     if (!mpack_node_is_missing(s_dbm_n)) {
-        siginfo->signal_dbm = mpack_node_u32(s_dbm_n);
-        siginfo->signal_type = kis_l1_signal_type_dbm;
+        siginfo.signal_dbm = mpack_node_u32(s_dbm_n);
+        siginfo.signal_type = kis_l1_signal_type_dbm;
     }
 
     auto n_dbm_n = mpack_node_map_uint_optional(sigmap, KIS_EXTERNAL_V3_KDS_SUB_SIGNAL_FIELD_NOISE_DBM);
     if (!mpack_node_is_missing(n_dbm_n)) {
-        siginfo->noise_dbm = mpack_node_u32(n_dbm_n);
+        siginfo.noise_dbm = mpack_node_u32(n_dbm_n);
     }
 
     auto s_rssi_n = mpack_node_map_uint_optional(sigmap, KIS_EXTERNAL_V3_KDS_SUB_SIGNAL_FIELD_SIGNAL_RSSI);
     if (!mpack_node_is_missing(s_rssi_n)) {
-        siginfo->signal_rssi = mpack_node_u32(s_rssi_n);
-        siginfo->signal_type = kis_l1_signal_type_rssi;
+        siginfo.signal_rssi = mpack_node_u32(s_rssi_n);
+        siginfo.signal_type = kis_l1_signal_type_rssi;
     }
 
     auto n_rssi_n = mpack_node_map_uint_optional(sigmap, KIS_EXTERNAL_V3_KDS_SUB_SIGNAL_FIELD_NOISE_RSSI);
     if (!mpack_node_is_missing(n_rssi_n)) {
-        siginfo->noise_rssi = mpack_node_u32(n_rssi_n);
+        siginfo.noise_rssi = mpack_node_u32(n_rssi_n);
     }
 
     auto freq_n = mpack_node_map_uint_optional(sigmap, KIS_EXTERNAL_V3_KDS_SUB_SIGNAL_FIELD_FREQ_KHZ);
     if (!mpack_node_is_missing(freq_n)) {
-        siginfo->freq_khz = mpack_node_u64(freq_n);
+        siginfo.freq_khz = mpack_node_u64(freq_n);
     }
 
     auto rate_n = mpack_node_map_uint_optional(sigmap, KIS_EXTERNAL_V3_KDS_SUB_SIGNAL_FIELD_DATARATE);
     if (!mpack_node_is_missing(rate_n)) {
-        siginfo->datarate = mpack_node_u64(rate_n);
+        siginfo.datarate = mpack_node_u64(rate_n);
     }
 
     auto channel_n = mpack_node_map_uint_optional(sigmap, KIS_EXTERNAL_V3_KDS_SUB_SIGNAL_FIELD_CHANNEL);
@@ -2079,23 +2114,24 @@ std::shared_ptr<kis_layer1_packinfo> kis_datasource::handle_sub_signal(mpack_nod
         auto channel_s = mpack_node_str(channel_n);
         auto channel_sz = mpack_node_data_len(channel_n);
 
-        siginfo->channel = std::string(channel_s, channel_sz);
+        siginfo.channel = std::string(channel_s, channel_sz);
     }
 
     if (mpack_tree_error(tree) != mpack_ok) {
         _MSG_ERROR("Kismet datasource {} got malformed v3 DATAREPORT (signal block)", get_source_name());
         trigger_error("invalid v3 DATAREPORT");
-        return nullptr;
+        return false;
     }
 
-    return siginfo;
+    siginfo.data_ok = true;
+    return true;
 }
 
-void kis_datasource::handle_rx_datalayer_v3(std::shared_ptr<kis_packet> packet,
+kis_datasource::rx_content kis_datasource::handle_rx_datalayer_v3(std::shared_ptr<kis_packet> packet,
         mpack_node_t& root, mpack_tree_t *tree) {
 
     if (!mpack_node_map_contains_uint(root, KIS_EXTERNAL_V3_KDS_DATAREPORT_FIELD_PACKETBLOCK)) {
-        return;
+        return rx_content::ignore;
     }
 
     auto datamap = mpack_node_map_uint(root, KIS_EXTERNAL_V3_KDS_DATAREPORT_FIELD_PACKETBLOCK);
@@ -2103,14 +2139,13 @@ void kis_datasource::handle_rx_datalayer_v3(std::shared_ptr<kis_packet> packet,
     if (mpack_tree_error(tree) != mpack_ok) {
         _MSG_ERROR("Kismet datasource got malformed v3 DATAREPORT");
         trigger_error("invalid v3 DATAREPORT");
-        return;
+        return rx_content::error;
     }
 
-    // If we have a packet report, but somehow we don't have data in the
-    // packet report, get out.
+    // A packet report with no data in it is broken
     auto content_n = mpack_node_map_uint_optional(datamap, KIS_EXTERNAL_V3_KDS_SUB_PACKET_FIELD_CONTENT);
     if (mpack_node_is_missing(content_n)) {
-        return;
+        return rx_content::error;
     }
 
     auto datachunk = packetchain->new_packet_component<kis_datachunk>();
@@ -2149,7 +2184,7 @@ void kis_datasource::handle_rx_datalayer_v3(std::shared_ptr<kis_packet> packet,
     if (mpack_tree_error(tree) != mpack_ok) {
         _MSG_ERROR("Kismet datasource got malformed v3 DATAREPORT");
         trigger_error("invalid v3 DATAREPORT");
-        return;
+        return rx_content::error;
     }
 
     if (!mpack_node_is_missing(olen_n)) {
@@ -2161,21 +2196,25 @@ void kis_datasource::handle_rx_datalayer_v3(std::shared_ptr<kis_packet> packet,
     if (mpack_tree_error(tree) != mpack_ok) {
         _MSG_ERROR("Kismet datasource got malformed v3 DATAREPORT");
         trigger_error("invalid v3 DATAREPORT");
-        return;
+        return rx_content::error;
     }
 
-    if (!handle_rx_data_content(packet.get(), datachunk.get(),
-                (const uint8_t *) content_data, content_sz)) {
-        return;
+    const auto r = handle_rx_data_content(packet.get(), datachunk.get(),
+            (const uint8_t *) content_data, content_sz);
+
+    if (r != rx_content::frame) {
+        return r;
     }
 
     packet->insert(pack_comp_linkframe, datachunk);
 
     get_source_packet_size_rrd()->add_sample(content_sz, Globalreg::globalreg->last_tv_sec);
+
+    return rx_content::frame;
 }
 
-int kis_datasource::handle_rx_data_content(kis_packet *packet, kis_datachunk *datachunk,
-        const uint8_t *content, size_t content_sz) {
+kis_datasource::rx_content kis_datasource::handle_rx_data_content(kis_packet *packet,
+        kis_datachunk *datachunk, const uint8_t *content, size_t content_sz) {
     // basic assignment of packet data to the data chunk, sufficient for datasources returning
     // real DLTs or other already-formatted data.  The content buffer here
     // is a portion of the stream buffer associated with the packet, so
@@ -2184,7 +2223,7 @@ int kis_datasource::handle_rx_data_content(kis_packet *packet, kis_datachunk *da
     packet->set_data(std::string_view((const char *) content, content_sz));
     datachunk->set_data(packet->data);
 
-    return 1;
+    return rx_content::frame;
 }
 
 void kis_datasource::handle_rx_jsonlayer_v3(std::shared_ptr<kis_packet> packet,
@@ -2256,8 +2295,9 @@ void kis_datasource::handle_packet_data_report_v3(uint32_t in_seqno, uint16_t co
     mpack_tree_init_data(&tree, in_packet.data(), in_packet.length());
 
     if (!mpack_tree_try_parse(&tree)) {
-        _MSG_ERROR("Kismet external interface got unparseable v3 OPENREPORT");
-        trigger_error("invalid v3 OPENREPORT");
+        _MSG_ERROR("Kismet external interface got unparseable v3 DATAREPORT");
+        trigger_error("invalid v3 DATAREPORT");
+        inc_source_num_error_packets(1);
         return;
     }
 
@@ -2277,31 +2317,26 @@ void kis_datasource::handle_packet_data_report_v3(uint32_t in_seqno, uint16_t co
         packet->set_data(std::string(in_packet));
     }
 
-    auto gpsinfo = handle_sub_gps(root, &tree);
+    handle_sub_gps(root, &tree, packet->gps_info);
 
     if (cancelled) {
         return;
     }
 
-    if (gpsinfo != nullptr) {
-        packet->insert(pack_comp_gps, gpsinfo);
-    } else if (suppress_gps) {
-        auto nogpsinfo = packetchain->new_packet_component<kis_no_gps_packinfo>();
-        packet->insert(pack_comp_no_gps, nogpsinfo);
-    } else if (device_gps != nullptr) {
+    if (suppress_gps && !packet->gps_info.gps_info_ok) {
+        packet->suppress_gps = true;
+    } else if (!packet->gps_info.gps_info_ok && device_gps != nullptr) {
         auto gpsinfo = device_gps->get_location();
 
-        if (gpsinfo != nullptr)
-            packet->insert(pack_comp_gps, gpsinfo);
+        if (gpsinfo != nullptr) {
+            packet->gps_info.set(gpsinfo);
+        }
     }
 
-    auto siginfo = handle_sub_signal(root, &tree);
+    handle_sub_signal(root, &tree, packet->signal_info);
+
     if (cancelled) {
         return;
-    }
-
-    if (siginfo != nullptr) {
-        packet->insert(pack_comp_l1info, siginfo);
     }
 
     handle_rx_jsonlayer_v3(packet, root, &tree);
@@ -2309,8 +2344,18 @@ void kis_datasource::handle_packet_data_report_v3(uint32_t in_seqno, uint16_t co
         return;
     }
 
-    handle_rx_datalayer_v3(packet, root, &tree);
+    const auto data = handle_rx_datalayer_v3(packet, root, &tree);
     if (cancelled) {
+        return;
+    }
+
+    if (data == rx_content::error) {
+        inc_source_num_error_packets(1);
+        return;
+    }
+
+    // Reports carrying no frame and no json (or a record which isn't a frame) aren't packets
+    if (data == rx_content::ignore && !packet->has(pack_comp_json)) {
         return;
     }
 
@@ -2819,10 +2864,11 @@ void kis_datasource::handle_packet_opensource_report_v2(uint32_t in_seqno,
     source_hop_vec->clear();
 
     // Add the channel= to the channels list
-    std::string def_chan = get_definition_opt("channel");
+    const auto def_chan_v = definition_channel_list(get_definition_opt("channel"));
+    const auto def_chan = def_chan_v.empty() ? std::string{} : def_chan_v[0];
     if (def_chan != "") {
         bool append = true;
-        for (const auto& sci : *source_hop_vec) {
+        for (const auto& sci : *source_channels_vec) {
             if (strcasecmp(sci.c_str(), def_chan.c_str()) == 0) {
                 append = false;
                 break;
@@ -2834,9 +2880,9 @@ void kis_datasource::handle_packet_opensource_report_v2(uint32_t in_seqno,
         }
     }
 
-    std::vector<std::string> def_vec = str_tokenize(get_definition_opt("channels"), ",");
-    std::vector<std::string> add_vec = str_tokenize(get_definition_opt("add_channels"), ",");
-    std::vector<std::string> block_vec = str_tokenize(get_definition_opt("block_channels"), ",");
+    std::vector<std::string> def_vec = definition_channel_list(get_definition_opt("channels"));
+    std::vector<std::string> add_vec = definition_channel_list(get_definition_opt("add_channels"));
+    std::vector<std::string> block_vec = definition_channel_list(get_definition_opt("block_channels"));
 
     if (def_vec.size() != 0) {
         // If we override the channels, use our supplied list entirely, and we don't
@@ -3106,6 +3152,7 @@ void kis_datasource::handle_packet_data_report_v2(uint32_t in_seqno,
                 std::string(" could not parse the data report, something is wrong with "
                     "the remote capture tool"), MSGFLAG_ERROR);
         trigger_error("Invalid KDSDATAREPORT");
+        inc_source_num_error_packets(1);
         return;
     }
 
@@ -3118,8 +3165,14 @@ void kis_datasource::handle_packet_data_report_v2(uint32_t in_seqno,
     auto packet = packetchain->generate_packet();
 
     // Process the data chunk
+    auto data = rx_content::ignore;
     if (report->has_packet()) {
-        handle_rx_datalayer_v2(packet, report->packet());
+        data = handle_rx_datalayer_v2(packet, report->packet());
+    }
+
+    if (data == rx_content::error) {
+        inc_source_num_error_packets(1);
+        return;
     }
 
     // Process JSON
@@ -3146,37 +3199,38 @@ void kis_datasource::handle_packet_data_report_v2(uint32_t in_seqno,
 
     // Signal
     if (report->has_signal()) {
-        auto siginfo = handle_sub_signal(report->signal());
-        packet->insert(pack_comp_l1info, siginfo);
+        handle_sub_signal(report->signal(), packet->signal_info);
     }
 
     // GPS
     if (report->has_gps()) {
-        auto gpsinfo = handle_sub_gps(report->gps());
-        packet->insert(pack_comp_gps, gpsinfo);
+        handle_sub_gps(report->gps(), packet->gps_info);
     } else if (suppress_gps) {
-        auto nogpsinfo = packetchain->new_packet_component<kis_no_gps_packinfo>();
-        packet->insert(pack_comp_no_gps, nogpsinfo);
+        packet->suppress_gps = true;
     } else if (device_gps != nullptr) {
         auto gpsinfo = device_gps->get_location();
 
         if (gpsinfo != nullptr)
-            packet->insert(pack_comp_gps, gpsinfo);
+            packet->gps_info.set(gpsinfo);
     }
 
     // TODO handle spectrum
+
+    // Reports carrying no frame, json or buffer (such as only a message) aren't packets
+    if (data == rx_content::ignore && !report->has_json() && !report->has_buffer()) {
+        return;
+    }
 
     handle_rx_packet(packet);
 
 }
 
-void kis_datasource::handle_rx_datalayer_v2(std::shared_ptr<kis_packet> packet,
+kis_datasource::rx_content kis_datasource::handle_rx_datalayer_v2(std::shared_ptr<kis_packet> packet,
         const KismetDatasource::SubPacket& report) {
 
-    // If we have a packet report, but somehow we don't have data in the
-    // packet report, get out.
+    // A packet report with no data in it is broken
     if (!report.has_data())
-        return;
+        return rx_content::error;
 
     auto datachunk = packetchain->new_packet_component<kis_datachunk>();
 
@@ -3209,6 +3263,8 @@ void kis_datasource::handle_rx_datalayer_v2(std::shared_ptr<kis_packet> packet,
     get_source_packet_size_rrd()->add_sample(report.data().length(), Globalreg::globalreg->last_tv_sec);
 
     packet->insert(pack_comp_linkframe, datachunk);
+
+    return rx_content::frame;
 }
 
 void kis_datasource::handle_rx_jsonlayer_v2(std::shared_ptr<kis_packet> packet,
@@ -3246,60 +3302,72 @@ void kis_datasource::handle_packet_warning_report_v2(uint32_t in_seqno,
     set_int_source_warning(report.warning());
 }
 
-std::shared_ptr<kis_layer1_packinfo> kis_datasource::handle_sub_signal(KismetDatasource::SubSignal in_sig) {
+bool kis_datasource::handle_sub_signal(KismetDatasource::SubSignal in_sig,
+        kis_layer1_packinfo &siginfo) {
     // Extract l1 info from a KV pair so we can add it to a packet
-    auto siginfo = packetchain->new_packet_component<kis_layer1_packinfo>();
+    // auto siginfo = packetchain->new_packet_component<kis_layer1_packinfo>();
+
+    bool has_siginfo = false;
 
     if (in_sig.has_signal_dbm()) {
-        siginfo->signal_type = kis_l1_signal_type_dbm;
-        siginfo->signal_dbm = in_sig.signal_dbm();
+        has_siginfo = true;
+        siginfo.signal_type = kis_l1_signal_type_dbm;
+        siginfo.signal_dbm = in_sig.signal_dbm();
     }
 
     if (in_sig.has_noise_dbm()) {
-        siginfo->signal_type = kis_l1_signal_type_dbm;
-        siginfo->noise_dbm = in_sig.noise_dbm();
+        has_siginfo = true;
+        siginfo.signal_type = kis_l1_signal_type_dbm;
+        siginfo.noise_dbm = in_sig.noise_dbm();
     }
 
     if (in_sig.has_signal_rssi()) {
-        siginfo->signal_type = kis_l1_signal_type_rssi;
-        siginfo->signal_rssi = in_sig.signal_rssi();
+        has_siginfo = true;
+        siginfo.signal_type = kis_l1_signal_type_rssi;
+        siginfo.signal_rssi = in_sig.signal_rssi();
     }
 
     if (in_sig.has_noise_rssi()) {
-        siginfo->signal_type = kis_l1_signal_type_rssi;
-        siginfo->noise_rssi = in_sig.noise_rssi();
+        has_siginfo = true;
+        siginfo.signal_type = kis_l1_signal_type_rssi;
+        siginfo.noise_rssi = in_sig.noise_rssi();
     }
 
-    if (in_sig.has_freq_khz())
-        siginfo->freq_khz = in_sig.freq_khz();
+    if (in_sig.has_freq_khz()) {
+        has_siginfo = true;
+        siginfo.freq_khz = in_sig.freq_khz();
+    }
 
-    if (in_sig.has_channel())
-        siginfo->channel = in_sig.channel();
+    if (in_sig.has_channel()) {
+        has_siginfo = true;
+        siginfo.channel = in_sig.channel();
+    }
 
-    if (in_sig.has_datarate())
-        siginfo->datarate = in_sig.datarate();
+    if (in_sig.has_datarate()) {
+        has_siginfo = true;
+        siginfo.datarate = in_sig.datarate();
+    }
 
-    return siginfo;
+    siginfo.data_ok = true;
+
+    return has_siginfo;
 }
 
-std::shared_ptr<kis_gps_packinfo> kis_datasource::handle_sub_gps(KismetDatasource::SubGps in_gps) {
+bool kis_datasource::handle_sub_gps(KismetDatasource::SubGps in_gps, kis_gps_packinfo& gpsinfo) {
     // Extract a GPS record from a packet and turn it into a packinfo gps log
-    auto gpsinfo = packetchain->new_packet_component<kis_gps_packinfo>();
 
-    gpsinfo->lat = in_gps.lat();
-    gpsinfo->lon = in_gps.lon();
-    gpsinfo->alt = in_gps.alt();
-    gpsinfo->speed = in_gps.speed();
-    gpsinfo->heading = in_gps.heading();
-    gpsinfo->precision = in_gps.precision();
-    gpsinfo->fix = in_gps.fix();
-    gpsinfo->tv.tv_sec = in_gps.time_sec();
-    gpsinfo->tv.tv_usec = in_gps.time_usec();
+    gpsinfo.gps_info_ok = true;
+    gpsinfo.lat = in_gps.lat();
+    gpsinfo.lon = in_gps.lon();
+    gpsinfo.alt = in_gps.alt();
+    gpsinfo.speed = in_gps.speed();
+    gpsinfo.heading = in_gps.heading();
+    gpsinfo.precision = in_gps.precision();
+    gpsinfo.fix = in_gps.fix();
+    gpsinfo.tv.tv_sec = in_gps.time_sec();
+    gpsinfo.tv.tv_usec = in_gps.time_usec();
 
-    //gpsinfo->type = in_gps.type();
-    //gpsinfo->gpsname = in_gps.name();
-
-    return gpsinfo;
+    return true;
 }
 
 unsigned int kis_datasource::send_probe_source_v2(std::string in_definition,
@@ -3573,10 +3641,15 @@ void kis_datasource::register_fields() {
             "Last known reason for error state", &source_error_reason);
 
     register_field("kismet.datasource.num_packets",
-            "Number of packets seen by source", &source_num_packets);
+            "Number of valid packets from source processed by the packet chain", &source_num_packets);
     register_field("kismet.datasource.num_error_packets",
-            "Number of invalid/error packets seen by source",
+            "Number of invalid packets from source",
             &source_num_error_packets);
+    register_field("kismet.datasource.num_filtered_packets",
+            "Number of packets filtered from source", &source_num_filtered_packets);
+    register_field("kismet.datasource.num_dropped_packets",
+            "Number of packets from source dropped because the packet queue was full",
+            &source_num_dropped_packets);
 
     packet_rate_rrd_id =
         register_dynamic_field("kismet.datasource.packets_rrd",
@@ -3621,7 +3694,7 @@ void kis_datasource::handle_source_error() {
         return;
 
     if (ping_timer_id > 0) {
-        timetracker->remove_timer(ping_timer_id);
+        timetracker->cancel_timer(ping_timer_id);
         ping_timer_id = -1;
     }
 
@@ -3708,7 +3781,7 @@ void kis_datasource::handle_source_error() {
 
                             std::shared_ptr<alert_tracker> alertracker =
                                 Globalreg::fetch_mandatory_global_as<alert_tracker>("ALERTTRACKER");
-                            alertracker->raise_one_shot("SOURCEOPEN", "SYSTEM", kis_alert_severity::critical, alrt, -1);
+                            alertracker->raise_one_shot("SOURCEOPEN", "SYSTEM", kis_alert_severity::info, alrt, -1);
 
                             if (get_source_hopping()) {
                                 // Reset the channel hop if we're hopping

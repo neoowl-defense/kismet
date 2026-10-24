@@ -263,6 +263,7 @@ int probe_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition
 
     /* Look for the interface type */
     if (strstr(interface, "rtl433") != interface) {
+        snprintf(msg, STATUS_MAX, "Expected a rtl433 interface, skipping");
         free(interface);
         return 0;
     }

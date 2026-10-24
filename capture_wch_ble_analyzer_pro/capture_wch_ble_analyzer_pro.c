@@ -196,13 +196,23 @@ int probe_callback(kis_capture_handler_t *caph, uint32_t seqno,
     interface = strndup(placeholder, placeholder_len);
 
     if (strstr(interface, "wch-btle") != interface) {
+        snprintf(msg, STATUS_MAX, "Expected a wch-btle interface, skipping");
         free(interface);
         return 0;
+    }
+
+    if (local->usb_ctx == NULL) {
+        x = libusb_init(&local->usb_ctx);
+        if (x < 0) {
+            snprintf(msg, STATUS_MAX, "Could not initialize libusb");
+            return 0;
+        }
     }
 
     wch_devs_cnt = wch_find_devices(local->usb_ctx, wch_devs);
 
     if (wch_devs_cnt <= 0) {
+        snprintf(msg, STATUS_MAX, "Didnt' find any wch USB devices");
         return 0;
     }
 
@@ -245,6 +255,8 @@ int probe_callback(kis_capture_handler_t *caph, uint32_t seqno,
     }
 
     if (!matched) {
+        snprintf(msg, STATUS_MAX, "Didn't find any matching wch interfaces for %s", interface);
+        free(interface);
         return 0;
     }
 
@@ -271,6 +283,8 @@ int list_callback(kis_capture_handler_t *caph, uint32_t seqno, char *msg,
         struct wch_list *next;
     } wch_list_t;
 
+    int r;
+
     wch_list_t *devs = NULL;
     size_t num_devs = 0;
 
@@ -284,6 +298,14 @@ int list_callback(kis_capture_handler_t *caph, uint32_t seqno, char *msg,
 
     wch_aggregate_t wch_aggregates[MAX_AGGREGATE_DEVICES];
     int wch_agg_cnt = 0;
+
+    if (local->usb_ctx == NULL) {
+        r = libusb_init(&local->usb_ctx);
+        if (r < 0) {
+            snprintf(msg, STATUS_MAX, "Could not initialize libusb");
+            return -1;
+        }
+    }
 
     wch_devs_cnt = wch_find_devices(local->usb_ctx, wch_devs);
 
@@ -376,6 +398,14 @@ int open_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition,
     if (strstr(local->interface, "wch-btle") != local->interface) {
         free(local->interface);
         return 0;
+    }
+
+    if (local->usb_ctx == NULL) {
+        x = libusb_init(&local->usb_ctx);
+        if (x < 0) {
+            snprintf(msg, STATUS_MAX, "Could not initialize libusb");
+            return -1;
+        }
     }
 
     wch_devs_cnt = wch_find_devices(local->usb_ctx, wch_devs);
@@ -597,12 +627,14 @@ static void on_packet(const wch_pkt_hdr_t *hdr, const uint8_t *pdu, int pdu_len,
 /* Run a standard glib mainloop inside the capture thread */
 void capture_thread(kis_capture_handler_t *caph) {
     local_wch_btle_t *local = (local_wch_btle_t *) caph->userdata;
+    char errstr[STATUS_MAX];
 
 #define DRAIN_POLL_MS  5
 #define IDLE_WAIT_MS   100
 
     while (1) {
         bool any_data = false;
+        bool any_open = false;
 
         if (caph->spindown) {
             break;
@@ -620,6 +652,15 @@ void capture_thread(kis_capture_handler_t *caph) {
                     continue;
                 }
 
+                if (n < 0) {
+                    snprintf(errstr, STATUS_MAX,
+                            "Unable to read from WCH radio %d %d:%d: %s, closing device",
+                            i, local->wch[i]->bus, local->wch[i]->addr,
+                            libusb_error_name(n));
+                    cf_send_message(caph, errstr, MSGFLAG_ERROR);
+                    wch_close_device(local->wch[i]);
+                }
+
                 break;
             }
         }
@@ -630,8 +671,30 @@ void capture_thread(kis_capture_handler_t *caph) {
             for (int i = 0; i < local->num_wch && !caph->spindown; i++) {
                 if (!local->wch[i]->is_open || !local->bufs[i])
                     continue;
-                wch_read_packets(local->wch[i], local->bufs[i], on_packet, caph, IDLE_WAIT_MS);
+
+                int n = wch_read_packets(local->wch[i], local->bufs[i], on_packet, caph, IDLE_WAIT_MS);
+
+                if (n < 0) {
+                    snprintf(errstr, STATUS_MAX,
+                            "Unable to read from WCH radio %d %d:%d: %s, closing device",
+                            i, local->wch[i]->bus, local->wch[i]->addr,
+                            libusb_error_name(n));
+                    cf_send_message(caph, errstr, MSGFLAG_ERROR);
+                    wch_close_device(local->wch[i]);
+                }
             }
+        }
+
+        /* If every configured MCU has failed and been closed, there is
+         * nothing left to capture from; stop looping so the handler spins
+         * down cleanly instead of busy-looping forever on a datasource
+         * that will never produce data again. */
+        for (int i = 0; i < local->num_wch; i++) {
+            any_open |= local->wch[i]->is_open;
+        }
+
+        if (!any_open) {
+            break;
         }
     }
 
@@ -640,6 +703,7 @@ void capture_thread(kis_capture_handler_t *caph) {
 
 int main(int argc, char *argv[]) {
     local_wch_btle_t localrad = {
+        .usb_ctx = NULL,
         .caph = NULL,
         .name = NULL,
         .interface = NULL,
@@ -663,12 +727,6 @@ int main(int argc, char *argv[]) {
         fprintf(stderr,
             "FATAL: Could not allocate basic handler data, your system "
             "is very low on RAM or something is wrong.\n");
-        return -1;
-    }
-
-    r = libusb_init(&localrad.usb_ctx);
-    if (r < 0) {
-        fprintf(stderr, "FATAL:  Could not initialize libusb\n");
         return -1;
     }
 
@@ -701,7 +759,8 @@ int main(int argc, char *argv[]) {
 
     cf_handler_shutdown(caph);
 
-    libusb_exit(localrad.usb_ctx);
+    if (localrad.usb_ctx != NULL)
+        libusb_exit(localrad.usb_ctx);
 
     return 0;
 }

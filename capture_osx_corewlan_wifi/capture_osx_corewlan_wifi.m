@@ -410,12 +410,14 @@ int probe_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition
     }
 
     if (!found_interface) {
+        snprintf(msg, STATUS_MAX, "Couldn't match interface, skipping");
         free(interface);
         return 0;
     }
 
     /* get the mac address; this should be standard for anything */
     if (ifconfig_get_hwaddr(interface, errstr, hwaddr) < 0) {
+        snprintf(msg, STATUS_MAX, "Couldn't get hardware address from interface: %s", errstr);
         free(interface);
         return 0;
     }
@@ -423,10 +425,14 @@ int probe_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition
     ret = populate_chanlist(local_wifi, interface, errstr, &((*ret_interface)->channels),
             &((*ret_interface)->channels_len));
 
-    free(interface);
 
-    if (ret < 0)
+    if (ret < 0) {
+        snprintf(msg, STATUS_MAX, "Couldn't populate channel list for %s", interface);
+        free(interface);
         return 0;
+    }
+
+    free(interface);
 
     /* Make a spoofed, but consistent, UUID based on the adler32 of the interface name
      * and the mac address of the device */

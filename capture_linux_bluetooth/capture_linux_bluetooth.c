@@ -48,6 +48,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <dirent.h>
+#include <time.h>
 
 #include "mgmtlib/bluetooth.h"
 #include "mgmtlib/hci.h"
@@ -77,6 +78,10 @@ typedef struct {
     /* Scanning type */
     uint8_t scan_type;
 
+    /* Controller is discovering, and when we last tried to set it up */
+    int discovering;
+    time_t last_setup;
+
     kis_capture_handler_t *caph;
 } local_bluetooth_t;
 
@@ -97,13 +102,22 @@ typedef struct {
 
 static char *eir_get_name(const uint8_t *eir, uint16_t eir_len);
 static unsigned int eir_get_flags(const uint8_t *eir, uint16_t eir_len);
+static char *eir_get_uuids_json(const uint8_t *eir, uint16_t eir_len);
+static void eir_get_manuf(const uint8_t *eir, uint16_t eir_len,
+        char **out_company_id_hex, char **out_data_hex);
+static char *eir_get_service_data_json(const uint8_t *eir, uint16_t eir_len);
 void bdaddr_to_string(const uint8_t *bdaddr, char *str);
 
 int cf_send_btjson(local_bluetooth_t *localbt, struct mgmt_ev_device_found *dev) {
-    char json[2048];
+    /* Bumped from 2048; EIR (240 bytes) can hold more UUIDs than the old
+     * payload needed room for. */
+    char json[8192];
 
     char address[BDADDR_STR_LEN];
     char *name, *safe_name;
+    char *uuids_json;
+    char *service_data_json;
+    char *manuf_company_id_hex, *manuf_data_hex;
     uint16_t eirlen;
 
     int r;
@@ -125,13 +139,27 @@ int cf_send_btjson(local_bluetooth_t *localbt, struct mgmt_ev_device_found *dev)
         safe_name = strdup("");
     }
 
-    snprintf(json, 2048, "{"
+    /* Same EIR buffer works for both classic and LE scans; no need to
+     * branch on dev->addr.type here. */
+    uuids_json = eir_get_uuids_json(dev->eir, eirlen);
+    service_data_json = eir_get_service_data_json(dev->eir, eirlen);
+    eir_get_manuf(dev->eir, eirlen, &manuf_company_id_hex, &manuf_data_hex);
+
+    snprintf(json, sizeof(json), "{"
             "\"addr\": \"%s\","
             "\"name\": \"%s\","
             "\"type\": %u,"
-            "\"connectable\": %u"
+            "\"connectable\": %u,"
+            "\"service_uuids\": %s,"
+            "\"service_data\": %s,"
+            "\"manuf_company_id\": \"%s\","
+            "\"manuf_data\": \"%s\""
             "}",
-            address, safe_name, dev->addr.type, (dev->flags & 0x04) ? 0 : 1);
+            address, safe_name, dev->addr.type, (dev->flags & 0x04) ? 0 : 1,
+            uuids_json,
+            service_data_json,
+            manuf_company_id_hex != NULL ? manuf_company_id_hex : "",
+            manuf_data_hex != NULL ? manuf_data_hex : "");
 
     if (safe_name != name) {
         free(safe_name);
@@ -140,6 +168,13 @@ int cf_send_btjson(local_bluetooth_t *localbt, struct mgmt_ev_device_found *dev)
     if (name != NULL) {
         free(name);
     }
+
+    free(uuids_json);
+    free(service_data_json);
+    if (manuf_company_id_hex != NULL)
+        free(manuf_company_id_hex);
+    if (manuf_data_hex != NULL)
+        free(manuf_data_hex);
 
     /* Pass RSSI from management event to Kismet via signal params */
     struct cf_params_signal sig;
@@ -345,6 +380,8 @@ void evt_controller_discovering(local_bluetooth_t *localbt, uint16_t len, const 
         return;
     }
 
+    localbt->discovering = dsc->discovering;
+
     if (!dsc->discovering) {
         cmd_start_discovery(localbt);
     }
@@ -405,11 +442,194 @@ static unsigned int eir_get_flags(const uint8_t *eir, uint16_t eir_len) {
     return 0;
 }
 
+/* Builds a JSON array of every 16/32/128-bit service UUID (AD types
+ * 0x02-0x07) found in an EIR/AD buffer. Returns a malloc'd string the
+ * caller must free ("[]" if none found or eir_len too short). */
+static char *eir_get_uuids_json(const uint8_t *eir, uint16_t eir_len) {
+    uint16_t parsed = 0;
+    char *out = malloc(4096);
+    size_t out_pos = 0;
+    int first = 1;
+    /* Longest entry (comma + quoted dashed 128-bit uuid) is 39 bytes;
+     * checked before every write so out_pos can never pass what snprintf
+     * actually wrote, even with LE Extended Advertising's larger AD data. */
+    const size_t max_entry = 40;
+
+    out[out_pos++] = '[';
+
+    if (eir_len >= 2) {
+        while (parsed < eir_len - 1) {
+            uint8_t field_len = eir[0];
+            uint8_t ad_type;
+            const uint8_t *payload;
+            uint8_t payload_len;
+            int i;
+
+            if (field_len == 0)
+                break;
+
+            parsed += field_len + 1;
+            if (parsed > eir_len)
+                break;
+
+            ad_type = eir[1];
+            payload = eir + 2;
+            payload_len = field_len - 1;
+
+            if (ad_type == 0x02 || ad_type == 0x03) {
+                for (i = 0; i + 2 <= payload_len; i += 2) {
+                    uint16_t val;
+                    if (out_pos + max_entry >= 4096)
+                        goto done;
+                    val = payload[i] | ((uint16_t) payload[i + 1] << 8);
+                    out_pos += snprintf(out + out_pos, 4096 - out_pos,
+                            "%s\"%04x\"", first ? "" : ",", val);
+                    first = 0;
+                }
+            } else if (ad_type == 0x04 || ad_type == 0x05) {
+                for (i = 0; i + 4 <= payload_len; i += 4) {
+                    uint32_t val;
+                    if (out_pos + max_entry >= 4096)
+                        goto done;
+                    val = payload[i] | ((uint32_t) payload[i + 1] << 8) |
+                        ((uint32_t) payload[i + 2] << 16) | ((uint32_t) payload[i + 3] << 24);
+                    out_pos += snprintf(out + out_pos, 4096 - out_pos,
+                            "%s\"%08x\"", first ? "" : ",", val);
+                    first = 0;
+                }
+            } else if (ad_type == 0x06 || ad_type == 0x07) {
+                /* 128-bit UUIDs are on-air little-endian; reverse then
+                 * dash into RFC 4122 canonical form. */
+                for (i = 0; i + 16 <= payload_len; i += 16) {
+                    char hex[33];
+                    int b;
+                    if (out_pos + max_entry >= 4096)
+                        goto done;
+                    for (b = 0; b < 16; b++)
+                        snprintf(hex + b * 2, 3, "%02x", payload[i + 15 - b]);
+                    out_pos += snprintf(out + out_pos, 4096 - out_pos,
+                            "%s\"%.8s-%.4s-%.4s-%.4s-%.12s\"",
+                            first ? "" : ",", hex, hex + 8, hex + 12, hex + 16, hex + 20);
+                    first = 0;
+                }
+            }
+
+            eir += field_len + 1;
+        }
+    }
+
+done:
+    if (out_pos < 4095)
+        out[out_pos++] = ']';
+    out[out_pos] = '\0';
+
+    return out;
+}
+
+/* Extracts Manufacturer Specific Data (AD type 0xFF) from an EIR/AD
+ * buffer: first 2 bytes are the little-endian company ID, the rest is
+ * the payload. *out_company_id_hex and *out_data_hex are malloc'd strings
+ * the caller must free, both NULL if none found. Only the first match is
+ * used; a device practically never sends more than one. */
+static void eir_get_manuf(const uint8_t *eir, uint16_t eir_len,
+        char **out_company_id_hex, char **out_data_hex) {
+    uint16_t parsed = 0;
+
+    *out_company_id_hex = NULL;
+    *out_data_hex = NULL;
+
+    if (eir_len < 2)
+        return;
+
+    while (parsed < eir_len - 1) {
+        uint8_t field_len = eir[0];
+
+        if (field_len == 0)
+            break;
+
+        parsed += field_len + 1;
+        if (parsed > eir_len)
+            break;
+
+        if (eir[1] == 0xFF && field_len >= 3) {
+            uint16_t company_id = eir[2] | ((uint16_t) eir[3] << 8);
+            size_t payload_len = field_len - 3;
+            char *company_hex = malloc(5);
+            char *data_hex = malloc(payload_len * 2 + 1);
+            size_t i;
+
+            snprintf(company_hex, 5, "%04x", company_id);
+            for (i = 0; i < payload_len; i++)
+                snprintf(data_hex + i * 2, 3, "%02x", eir[4 + i]);
+            data_hex[payload_len * 2] = '\0';
+
+            *out_company_id_hex = company_hex;
+            *out_data_hex = data_hex;
+            return;
+        }
+
+        eir += field_len + 1;
+    }
+}
+
+/* 16-bit UUID service data records (such as Remote ID) as a JSON array of hex
+ * strings, each the UUID followed by the data */
+static char *eir_get_service_data_json(const uint8_t *eir, uint16_t eir_len) {
+    /* Worst case every byte becomes 2 hex chars, plus quoting and commas */
+    size_t bufsz = (size_t) eir_len * 4 + 3;
+    char *ret = malloc(bufsz);
+    size_t pos = 0;
+    uint16_t parsed = 0;
+    int first = 1;
+
+    if (ret == NULL)
+        return strdup("[]");
+
+    ret[pos++] = '[';
+
+    while (eir_len >= 2 && parsed < eir_len - 1) {
+        uint8_t field_len = eir[0];
+        size_t i;
+
+        if (field_len == 0)
+            break;
+
+        parsed += field_len + 1;
+        if (parsed > eir_len)
+            break;
+
+        if (eir[1] == 0x16 && field_len >= 3) {
+            if (!first)
+                ret[pos++] = ',';
+            first = 0;
+
+            ret[pos++] = '"';
+            for (i = 0; i < (size_t) field_len - 1; i++) {
+                snprintf(ret + pos, 3, "%02x", eir[2 + i]);
+                pos += 2;
+            }
+            ret[pos++] = '"';
+        }
+
+        eir += field_len + 1;
+    }
+
+    ret[pos++] = ']';
+    ret[pos] = '\0';
+
+    return ret;
+}
+
 /* Actual device found in scan trigger */
 void evt_device_found(local_bluetooth_t *localbt, uint16_t len, const void *param) {
     struct mgmt_ev_device_found *dev = (struct mgmt_ev_device_found *) param;
 
     if (len < sizeof(struct mgmt_ev_device_found)) {
+        return;
+    }
+
+    /* The EIR data has to fit in the event */
+    if (le16toh(dev->eir_len) > len - sizeof(struct mgmt_ev_device_found)) {
         return;
     }
 
@@ -461,6 +681,7 @@ void handle_mgmt_response(local_bluetooth_t *localbt) {
 
         /* Ignore events not for us */
         if (rindex != localbt->devid) {
+            free(evt);
             continue;
         }
 
@@ -521,21 +742,26 @@ void handle_mgmt_response(local_bluetooth_t *localbt) {
         } else {
             switch (ropcode) {
                 case MGMT_EV_DISCOVERING:
-                    evt_controller_discovering(localbt,
-                            rlength - sizeof(bluez_mgmt_command_t),
-                            evt->param);
+                    evt_controller_discovering(localbt, rlength, evt->param);
                     break;
                 case MGMT_EV_DEVICE_FOUND:
-                    evt_device_found(localbt,
-                            rlength - sizeof(bluez_mgmt_command_t),
-                            evt->param);
+                    evt_device_found(localbt, rlength, evt->param);
                     break;
                 case MGMT_EV_INDEX_REMOVED:
                     /* we only get here if rindex matches, so we know our own
-                     * device got removed */
+                     * device got removed; a USB reset removes and re-adds it */
                     snprintf(errstr, STATUS_MAX,
-                            "Bluetooth interface hci%u was removed", rindex);
-                    cf_send_error(localbt->caph, 0, errstr);
+                            "Bluetooth interface hci%u was removed, waiting for it to "
+                            "return", rindex);
+                    cf_send_message(localbt->caph, errstr, MSGFLAG_ERROR);
+                    localbt->discovering = 0;
+                    break;
+                case MGMT_EV_INDEX_ADDED:
+                    snprintf(errstr, STATUS_MAX,
+                            "Bluetooth interface hci%u returned, restarting discovery",
+                            rindex);
+                    cf_send_message(localbt->caph, errstr, MSGFLAG_INFO);
+                    cmd_get_controller_info(localbt);
                     break;
 
                 default:
@@ -578,11 +804,13 @@ int probe_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition
     interface = strndup(placeholder, placeholder_len);
 
     if (sscanf(interface, "hci%u", &devid) != 1) {
+        snprintf(msg, STATUS_MAX, "Expected hciX interface, skipping");
         free(interface);
         return 0;
     }
 
     if ((hci_sock = socket(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI)) < 0) {
+        snprintf(msg, STATUS_MAX, "Unable to create a Bluetooth HCI socket to %s", interface);
         free(interface);
         return 0;
     }
@@ -590,6 +818,7 @@ int probe_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition
     di.dev_id = devid;
 
     if (ioctl(hci_sock, HCIGETDEVINFO, (void *) &di)) {
+        snprintf(msg, STATUS_MAX, "Unable to fetch Bluetooth device info from %s", interface);
         free(interface);
         return 0;
     }
@@ -739,7 +968,10 @@ int open_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition,
 
     if (localbt->bt_interface != NULL)
         free(localbt->bt_interface);
-    localbt->bt_interface = strdup(interface);
+
+    char ifrename[64];
+    snprintf(ifrename, 64, "hci%u", localbt->devid);
+    localbt->bt_interface = strdup(ifrename);
 
     free(interface);
     close(hci_sock);
@@ -812,6 +1044,8 @@ int open_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition,
         return -1;
     }
 
+    localbt->discovering = 0;
+    localbt->last_setup = time(0);
     cmd_get_controller_info(localbt);
 
     return 1;
@@ -853,6 +1087,13 @@ void capture_thread(kis_capture_handler_t *caph) {
             continue;
         }
 
+        /* Setup can lose a race with bluetoothd after a controller reset (a busy
+         * power or discovery command), so redo it until the controller is discovering */
+        if (!localbt->discovering && time(0) - localbt->last_setup >= 2) {
+            localbt->last_setup = time(0);
+            cmd_get_controller_info(localbt);
+        }
+
         if (FD_ISSET(localbt->mgmt_fd, &rset)) {
             while (kis_simple_ringbuf_available(localbt->read_rbuf)) {
                 ssize_t amt_read;
@@ -892,6 +1133,8 @@ int main(int argc, char *argv[]) {
         .mgmt_fd = 0,
         .read_rbuf = NULL,
         .scan_type = SCAN_TYPE_DUAL,
+        .discovering = 0,
+        .last_setup = 0,
         .caph = NULL,
     };
 

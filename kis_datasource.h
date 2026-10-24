@@ -21,6 +21,7 @@
 
 #include "config.h"
 
+#include <atomic>
 #include <functional>
 
 #include "globalregistry.h"
@@ -122,6 +123,9 @@ public:
 
     __Proxy(hop_capable, uint8_t, bool, bool, hop_capable);
 
+    // Maximum hops per second, 0 for unlimited
+    __Proxy(max_hop_rate, double, double, double, max_hop_rate);
+
 protected:
     virtual void register_fields() override {
         tracker_component::register_fields();
@@ -158,6 +162,9 @@ protected:
 
         register_field("kismet.datasource_driver.hop_capable",
                 "Datasource can channel hop", &hop_capable);
+
+        register_field("kismet.datasource.driver.max_hop_rate",
+                "Maximum channel hop rate (hops/sec), 0 for unlimited", &max_hop_rate);
     }
 
     virtual void reserve_fields(std::shared_ptr<tracker_element_map> e) override {
@@ -182,6 +189,7 @@ protected:
     std::shared_ptr<tracker_element_uint8> passive_capable;
     std::shared_ptr<tracker_element_uint8> tune_capable;
     std::shared_ptr<tracker_element_uint8> hop_capable;
+    std::shared_ptr<tracker_element_double> max_hop_rate;
 };
 
 
@@ -320,10 +328,23 @@ public:
     virtual void close_source_async(std::function<void (void)> cb);
 
 
+    // Closes a source at the user's request.  The error retry is disabled, so the source
+    // stays closed until re-opened; remote sources re-open when the remote reconnects.
+    virtual void stop_source();
+
     // Disables a source
-    // Cancels any current activity, and sends a terminate to the capture binary.
-    // Disables any error state and disables the error retry.
+    // Closes the source, marks it in error, and disables the error retry.  Disabled sources
+    // stay closed, and remote reconnects are refused, until the source is re-opened.
     virtual void disable_source();
+
+    bool get_source_disabled() const {
+        return source_disabled.load();
+    }
+
+    void clear_source_disabled() {
+        if (source_disabled.exchange(false))
+            set_int_source_error_reason("");
+    }
 
 
     // Pauses a source
@@ -395,6 +416,12 @@ public:
     __ProxyM(source_num_error_packets, uint64_t, uint64_t, uint64_t, source_num_error_packets, data_mutex);
     __ProxyIncDecAtomic(source_num_error_packets, uint64_t, uint64_t, source_num_error_packets);
 
+    __ProxyM(source_num_filtered_packets, uint64_t, uint64_t, uint64_t, source_num_filtered_packets, data_mutex);
+    __ProxyIncDecAtomic(source_num_filtered_packets, uint64_t, uint64_t, source_num_filtered_packets);
+
+    __ProxyM(source_num_dropped_packets, uint64_t, uint64_t, uint64_t, source_num_dropped_packets, data_mutex);
+    __ProxyIncDecAtomic(source_num_dropped_packets, uint64_t, uint64_t, source_num_dropped_packets);
+
     __ProxyDynamicTrackableM(source_packet_rrd, kis_tracked_rrd<>,
             packet_rate_rrd, packet_rate_rrd_id, data_mutex);
 
@@ -462,12 +489,19 @@ public:
     static std::string event_datasource_paused() { return "DATASOURCE_PAUSED"; }
     static std::string event_datasource_resumed() { return "DATASOURCE_RESUMED"; }
 
+    // What the data layer of a report held
+    enum class rx_content : uint8_t {
+        frame,
+        error,
+        ignore,
+    };
+
 #ifdef HAVE_PROTOBUF_CPP
     // Manipulate incoming packet data before it is inserted into the base packet; Subclasses can use
     // this to modify the data before it hits the linkframe to minimize copy overhead.  When replacing
     // this function, replacements MUST implement the full timestamp, RRD update, etc found in the
     // base function.
-    virtual void handle_rx_datalayer_v2(std::shared_ptr<kis_packet> packet,
+    virtual rx_content handle_rx_datalayer_v2(std::shared_ptr<kis_packet> packet,
             const KismetDatasource::SubPacket& report);
 
     // Manipulate incoming packet json before it is inserted into the base packet; Subclasses can use
@@ -480,7 +514,7 @@ public:
     // this to modify the data before it hits the linkframe to minimize copy overhead.  When replacing
     // this function, replacements MUST implement the full timestamp, RRD update, etc found in the
     // base function.
-    virtual void handle_rx_datalayer_v3(std::shared_ptr<kis_packet> packet,
+    virtual rx_content handle_rx_datalayer_v3(std::shared_ptr<kis_packet> packet,
             mpack_node_t& root, mpack_tree_t *tree);
 
     // Manipulate incoming packet json before it is inserted into the base packet; Subclasses can use
@@ -488,8 +522,10 @@ public:
     virtual void handle_rx_jsonlayer_v3(std::shared_ptr<kis_packet> packet,
             mpack_node_t& root, mpack_tree_t *tree);
 
-    // Manipulate and insert the decapsulated data into a packet
-    virtual int handle_rx_data_content(kis_packet *packet,
+    // Manipulate and insert the decapsulated data into a packet.  Return frame when the datachunk
+    // holds the frame (set packet->error as well to keep a bad frame for logging), error when the
+    // content is malformed and is only counted, and ignore when the content isn't a frame at all
+    virtual rx_content handle_rx_data_content(kis_packet *packet,
             kis_datachunk *datachunk, const uint8_t *content, size_t content_sz);
 
     // Handle injecting packets into the packet chain after the data report has been received
@@ -556,19 +592,26 @@ protected:
             timetracker =
                 Globalreg::fetch_mandatory_global_as<time_tracker>();
 
-            // Generate a timeout for 5 seconds from now
-            auto src_alias = in_src;
+            // Generate a timeout for 30 seconds from now; it may run after this command or
+            // the source is gone, so it holds only a weak source and the sequence
+            std::weak_ptr<kis_external_interface> src_weak = in_src->weak_from_this();
             timer_id = timetracker->register_timer(SERVER_TIMESLICES_SEC * 30,
-                    NULL, 0, [src_alias, this](int) -> int {
-                    src_alias->cancel_command(command_seq, "Command did not complete");
+                    NULL, 0, [src_weak, in_seq](int) -> int {
+                    auto src = std::static_pointer_cast<kis_datasource>(src_weak.lock());
+
+                    if (src != nullptr)
+                        src->cancel_command(in_seq, "Command did not complete");
+
                     return 0;
                 });
 
         }
 
         ~tracked_command() {
+            // Destroyed under ext_mutex, which the timeout takes; the timeout holds only
+            // the source and sequence, so it may safely finish after we're gone
             if (timer_id > -1) {
-                timetracker->remove_timer(timer_id);
+                timetracker->cancel_timer(timer_id);
                 timer_id = -1;
             }
         }
@@ -659,13 +702,13 @@ protected:
 
     virtual void handle_msg_proxy(const std::string& msg, const int type) override;
 
-    // specific decoders to break out signal and gps extraction for derivitive classes; to be passed the
+    // specific decoders to break out signal and gps extraction for derivative classes; to be passed the
     // decoded packet mpack tree.  most child classes shouldn't ever need to touch this since it also
     // implies handling the whole raw packet.
-    virtual std::shared_ptr<kis_gps_packinfo> handle_sub_gps(mpack_node_t& root,
-            mpack_tree_t *tree);
-    virtual std::shared_ptr<kis_layer1_packinfo> handle_sub_signal(mpack_node_t& root,
-            mpack_tree_t *tree);
+    virtual bool handle_sub_gps(mpack_node_t& root,
+            mpack_tree_t *tree, kis_gps_packinfo& gpsinfo);
+    virtual bool handle_sub_signal(mpack_node_t& root,
+            mpack_tree_t *tree, kis_layer1_packinfo& siginfo);
 
 #ifdef HAVE_PROTOBUF_CPP
     // legacy v2 protocol handlers, to be phased out.  these are all optional, and require Kismet to be
@@ -695,9 +738,9 @@ protected:
     virtual unsigned int send_probe_source_v2(std::string in_defintion, unsigned int in_transaction,
             probe_callback_t in_cb);
 
-    // specific decoders broken out for derivitive classes to access signal and gps easily
-    virtual std::shared_ptr<kis_gps_packinfo> handle_sub_gps(KismetDatasource::SubGps in_gps);
-    virtual std::shared_ptr<kis_layer1_packinfo> handle_sub_signal(KismetDatasource::SubSignal in_signal);
+    // specific decoders broken out for derivative classes to access signal and gps easily
+    virtual bool handle_sub_gps(KismetDatasource::SubGps in_gps, kis_gps_packinfo& gpsinfo);
+    bool handle_sub_signal(KismetDatasource::SubSignal in_signal, kis_layer1_packinfo& siginfo);
 #endif
 
 
@@ -792,6 +835,8 @@ protected:
 
     std::shared_ptr<tracker_element_atomic_uint64> source_num_packets;
     std::shared_ptr<tracker_element_atomic_uint64> source_num_error_packets;
+    std::shared_ptr<tracker_element_atomic_uint64> source_num_filtered_packets;
+    std::shared_ptr<tracker_element_atomic_uint64> source_num_dropped_packets;
 
     int packet_rate_rrd_id;
     std::shared_ptr<kis_tracked_rrd<>> packet_rate_rrd;
@@ -882,6 +927,8 @@ protected:
     std::vector<shared_interface> listed_interfaces;
     int listed_interface_entry_id;
 
+    std::atomic<bool> source_disabled{false};
+
     // Special modes which suppress error output and retry handling
     bool mode_probing;
     bool mode_listing;
@@ -899,8 +946,7 @@ protected:
     std::shared_ptr<kis_gps> device_gps;
 
     // Packet components we inject
-    int pack_comp_report, pack_comp_linkframe, pack_comp_l1info, pack_comp_l1_agg,
-        pack_comp_gps, pack_comp_no_gps,
+    int pack_comp_report, pack_comp_linkframe, pack_comp_l1_agg,
         pack_comp_datasrc, pack_comp_json, pack_comp_protobuf;
 
     virtual void handle_v2_pong_event() override;

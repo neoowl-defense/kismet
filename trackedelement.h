@@ -391,7 +391,7 @@ constexpr17 C tracker_element_clone_adaptor(C p) {
     // return std::static_pointer_cast<c_t>(std::shared_ptr<tracker_element>(std::move(p->clone_type())));
 }
 
-// Aliased element used to link one element to anothers name, for instance to
+// Aliased element used to link one element to another's name, for instance to
 // allow the dot11 tracker a way to link the most recently used ssid from the
 // map to a custom field
 class tracker_element_alias : public tracker_element {
@@ -2178,8 +2178,9 @@ public:
     }
 
     void reset() {
-        // do nothing, keep old data until new data is set since a pair has
-        // no reset function; determine if this is safe in the future
+        // Pooled owners (location triplets) are reused; stale data would leak
+        // into the next owner
+        pair = pair_t{};
     }
 
     virtual bool is_stringable() const override {
@@ -2293,6 +2294,31 @@ using tracker_element_mapvec = tracker_element_core_vector<
     std::shared_ptr<tracker_element>,
     tracker_element_value_adapter_self_json,
     tracker_type::tracker_summary_mapvec>;
+
+// Summary of an element; its fields are references into the source, so serializing the
+// summary re-runs the source's serialization hooks (such as a device's lock) around them
+class tracker_element_summary_mapvec : public tracker_element_mapvec {
+public:
+    tracker_element_summary_mapvec() :
+        tracker_element_mapvec() { }
+
+    void set_summary_source(const std::shared_ptr<tracker_element>& s) {
+        source = s;
+    }
+
+    virtual void pre_serialize() override {
+        if (source != nullptr)
+            source->pre_serialize();
+    }
+
+    virtual void post_serialize() override {
+        if (source != nullptr)
+            source->post_serialize();
+    }
+
+protected:
+    std::shared_ptr<tracker_element> source;
+};
 
 // Templated generic access functions
 
@@ -2471,6 +2497,10 @@ std::shared_ptr<tracker_element> summarize_tracker_element(std::shared_ptr<track
 // Handle comparing fields
 bool sort_tracker_element_less(const std::shared_ptr<tracker_element> lhs,
         const std::shared_ptr<tracker_element> rhs);
+
+// Copy the value of a sortable scalar so it can be compared after the owning object is
+// unlocked; elements fast_sort_tracker_element_less doesn't compare are returned as-is
+std::shared_ptr<tracker_element> clone_sortable_tracker_element(const std::shared_ptr<tracker_element>& e);
 
 // Compare fields, in a faster, but not type-safe, way.  This should be used only when
 // the caller is positive that both fields are of the same type, but avoids a number of

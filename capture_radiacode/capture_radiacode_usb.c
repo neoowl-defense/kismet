@@ -18,7 +18,7 @@
 
 /*
  * This datasource interfaces with the Radiacode geiger counter
- * https://www.radiacode.
+ * https://www.radiacode.com/
  *
  * This datasource uses libusb to interface & requires a usb 
  * connection.
@@ -199,7 +199,7 @@ char *radiacode_transport_execute(radiacode_comms_t *comms,
 
         trials = 0
         max_trials = 3
-        while trials < max_trials:  # repeat until non-zero lenght data received
+        while trials < max_trials:  # repeat until non-zero length data received
             data = self._device.read(0x81, 256, timeout=self._timeout_ms).tobytes()
             if len(data) != 0:
                 break
@@ -252,6 +252,7 @@ int probe_callback(kis_capture_handler_t *caph, uint32_t seqno,
     interface = strndup(placeholder, placeholder_len);
 
     if (strstr(interface, "radiacode-usb") != interface) {
+        snprintf(msg, STATUS_MAX, "Expected a radiacode-usb interface, skipping");
         free(interface);
         return 0;
     }
@@ -270,9 +271,18 @@ int probe_callback(kis_capture_handler_t *caph, uint32_t seqno,
 		return 0;
 	}
 
+    if (localrad->usb_ctx == NULL) {
+        r = libusb_init(&localrad->usb_ctx);
+        if (r < 0) {
+            snprintf(msg, STATUS_MAX, "radiacode: could not initialize libusb");
+            return 0;
+        }
+    }
+
     libusb_devices_cnt = libusb_get_device_list(localrad->usb_ctx, &libusb_devs);
 
     if (libusb_devices_cnt < 0) {
+        snprintf(msg, STATUS_MAX, "Found no USB devices, skipping");
         return 0;
     }
 
@@ -344,6 +354,15 @@ int list_callback(kis_capture_handler_t *caph, uint32_t seqno, char *msg,
     unsigned int i;
 
     local_radiacode_t *localrad = (local_radiacode_t *) caph->userdata;
+
+    if (localrad->usb_ctx == NULL) {
+        r = libusb_init(&localrad->usb_ctx);
+        if (r < 0) {
+            snprintf(msg, STATUS_MAX, "radiacode: could not initialize libusb");
+            return 0;
+        }
+    }
+
     libusb_devices_cnt = libusb_get_device_list(localrad->usb_ctx, &libusb_devs);
 
     if (libusb_devices_cnt < 0) {
@@ -468,7 +487,7 @@ int open_usb_device(kis_capture_handler_t *caph, char *errstr) {
     }
 
 	/* It appears the radiacode needs to sink all pending io on open before
-	 * issueing commands, spin burning data until we time out */
+	 * issuing commands, spin burning data until we time out */
 	while (1) {
 		r = libusb_bulk_transfer(localrad->usb_handle, 0x81,
 				(unsigned char *) sinkbuf, 256, &sink_len, 500);
@@ -586,6 +605,14 @@ int open_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition,
         localrad->name = strndup(placeholder, placeholder_len);
     } else {
         localrad->name = strdup(localrad->interface);
+    }
+
+    if (localrad->usb_ctx == NULL) {
+        r = libusb_init(&localrad->usb_ctx);
+        if (r < 0) {
+            snprintf(msg, STATUS_MAX, "radiacode: could not initialize libusb");
+            return -1;
+        }
     }
 
     libusb_devices_cnt = libusb_get_device_list(localrad->usb_ctx, &libusb_devs);
@@ -753,12 +780,6 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
-	r = libusb_init(&localrad.usb_ctx);
-	if (r < 0) {
-		fprintf(stderr, "FATAL:  Could not initialize libusb\n");
-		return -1;
-	}
-
     localrad.caph = caph;
 
     cf_handler_set_userdata(caph, &localrad);
@@ -788,7 +809,9 @@ int main(int argc, char *argv[]) {
 
     cf_handler_shutdown(caph);
 
-    libusb_exit(localrad.usb_ctx);
+    if (localrad.usb_ctx != NULL) {
+        libusb_exit(localrad.usb_ctx);
+    }
 
     return 0;
 }

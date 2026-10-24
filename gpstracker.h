@@ -76,7 +76,10 @@ public:
 
     virtual void trigger_deferred_startup() override;
 
-    // Register a gps builer prototype
+    // Close every GPS while the IO threads still run, so drivers can undo device changes
+    virtual void trigger_deferred_shutdown() override;
+
+    // Register a gps builder prototype
     void register_gps_builder(shared_gps_builder in_builder);
 
     // Create a GPS from a definition string
@@ -98,6 +101,7 @@ public:
 
     // get the best location (as in the 'best' gps devices first)
     std::shared_ptr<kis_gps_packinfo> get_best_location();
+	void get_best_location(kis_gps_packinfo& location);
 
     // Populate packets that don't have a GPS location
     static int kis_gpspack_hook(CHAINCALL_PARMS);
@@ -120,13 +124,14 @@ protected:
 
     // Logging function
     void log_snapshot_gps();
+    void log_snapshot_satellites();
 
     // Do we log to the Kismet log?
     bool database_logging;
     // Timer for logging GPS path as a snapshot
     int log_snapshot_timer;
-
-    int pack_comp_gps, pack_comp_no_gps;
+    // Timer for logging each GPS's satellites in view
+    int log_satellites_timer;
 
     std::shared_ptr<time_tracker> timetracker;
     int event_timer_id;

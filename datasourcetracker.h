@@ -329,6 +329,9 @@ public:
     // the main select loop in kismet
     virtual void trigger_deferred_startup() override;
 
+    // Open the sources from -c or source=, once plugins are active
+    void launch_configured_sources();
+
     // Shut down all sources, this happens as kismet is terminating
     virtual void trigger_deferred_shutdown() override;
 
@@ -383,6 +386,9 @@ public:
     // Parse a rate string
     double string_to_rate(std::string in_str, double in_default);
 
+    // The hop rate for a source: its channel_hoprate= option, else the configured default
+    double definition_hop_rate(shared_datasource in_ds);
+
     // Access the defaults
     std::shared_ptr<datasource_tracker_defaults> get_config_defaults();
 
@@ -420,6 +426,9 @@ protected:
     kis_mutex dst_lock;
 
     int pack_comp_datasrc;
+
+    // Late packetchain handler counting valid, error and filtered packets per source
+    int packet_stats_handler_id;
 
     int proto_id;
     int source_id;

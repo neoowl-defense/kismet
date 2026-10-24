@@ -130,8 +130,6 @@ kis_wiglecsv_logfile::kis_wiglecsv_logfile(shared_log_builder in_builder) :
 
     auto packetchain = Globalreg::fetch_mandatory_global_as<packet_chain>();
 
-    pack_comp_l1info = packetchain->register_packet_component("RADIODATA");
-    pack_comp_gps = packetchain->register_packet_component("GPS");
 	pack_comp_device = packetchain->register_packet_component("DEVICE");
 
     throttle_seconds =
@@ -198,6 +196,14 @@ bool kis_wiglecsv_logfile::open_log(const std::string& in_template, const std::s
 }
 
 void kis_wiglecsv_logfile::close_log() {
+    // Remove the handler before taking log_mutex; remove_handler() waits for packet threads
+    // still in packet_handler(), which takes log_mutex
+    auto packetchain =
+        Globalreg::fetch_global_as<packet_chain>();
+    if (packetchain != nullptr) {
+        packetchain->remove_handler(&kis_wiglecsv_logfile::packet_handler, CHAINPOS_LOGGING);
+    }
+
     kis_lock_guard<kis_mutex> lk(log_mutex);
 
     set_int_log_open(false);
@@ -206,12 +212,6 @@ void kis_wiglecsv_logfile::close_log() {
         fclose(csvfile);
 
     csvfile = nullptr;
-
-    auto packetchain =
-        Globalreg::fetch_global_as<packet_chain>();
-    if (packetchain != nullptr) {
-        packetchain->remove_handler(&kis_wiglecsv_logfile::packet_handler, CHAINPOS_LOGGING);
-    }
 }
 
 int kis_wiglecsv_logfile::packet_handler(CHAINCALL_PARMS) {
@@ -231,27 +231,26 @@ int kis_wiglecsv_logfile::packet_handler(CHAINCALL_PARMS) {
     if (wigle->stream_paused)
         return 1;
 
-    if (!in_pack->common_info_ok) {
+    if (!in_pack->common_info.common_info_ok) {
         return 1;
     }
 
-    auto l1info = in_pack->fetch<kis_layer1_packinfo>(wigle->pack_comp_l1info);
-    auto gps = in_pack->fetch<kis_gps_packinfo>(wigle->pack_comp_gps);
     auto devs = in_pack->fetch<kis_tracked_device_info>(wigle->pack_comp_device);
 
-    if (gps == nullptr || devs == nullptr)
+    if (!in_pack->gps_info.gps_info_ok || devs == nullptr)
         return 1;
 
-    if (gps->lat == 0 || gps->lon == 0)
+    if (in_pack->gps_info.lat == 0 || in_pack->gps_info.lon == 0)
         return 1;
 
     int signal = 0;
 
-    if (l1info != nullptr) {
-        if (l1info->signal_type == kis_l1_signal_type_dbm)
-            signal = l1info->signal_dbm;
-        else
-            signal = l1info->signal_rssi;
+    if (in_pack->signal_info.data_ok) {
+        if (in_pack->signal_info.signal_type == kis_l1_signal_type_dbm) {
+            signal = in_pack->signal_info.signal_dbm;
+        } else {
+            signal = in_pack->signal_info.signal_rssi;
+        }
     }
 
     // Ignore all but management packets; we don't wigle-log data frames
@@ -266,17 +265,19 @@ int kis_wiglecsv_logfile::packet_handler(CHAINCALL_PARMS) {
     auto dev = d_k->second;
 
     // Stop looking at all if we're w/in the timeout for logging this device
-    const auto& time_k = wigle->timer_map.find(dev->get_key());
+    {
+        kis_lock_guard<kis_mutex> tlk(wigle->timer_mutex, "wigle timer_map");
 
-    if (time_k != wigle->timer_map.end()) {
-        if (time(0) < time_k->second)
-            return 1;
+        const auto& time_k = wigle->timer_map.find(dev->get_key());
+
+        if (time_k != wigle->timer_map.end()) {
+            if (time(0) < time_k->second)
+                return 1;
+        }
     }
 
-    // Lock the device tracker while we log this packet because we need to interact
-    // with the device internals
-
-    kis_lock_guard<kis_mutex> device_lk(wigle->devicetracker->get_devicelist_mutex());
+    // Hold the device while reading its internals
+    kis_device_lock device_lk(dev, true);
 
     // Break into per-phy handling
     if (wigle->dot11_phy->device_is_a(dev)) {
@@ -323,8 +324,8 @@ int kis_wiglecsv_logfile::packet_handler(CHAINCALL_PARMS) {
                 (int) channel,
                 dev->get_frequency(),
                 signal,
-                gps->lat, gps->lon, gps->alt,
-                0, // TODO - dereive a gps accuracy
+                in_pack->gps_info.lat, in_pack->gps_info.lon, in_pack->gps_info.alt,
+                0, // TODO - derive a gps accuracy
                 "WIFI");
 
     } else if (wigle->bt_phy->device_is_a(dev)) {
@@ -372,7 +373,7 @@ int kis_wiglecsv_logfile::packet_handler(CHAINCALL_PARMS) {
                 0, // no channel for bluetooth
                 "", // todo - fill in device type code
                 signal,
-                gps->lat, gps->lon, gps->alt,
+                in_pack->gps_info.lat, in_pack->gps_info.lon, in_pack->gps_info.alt,
                 0, // todo - derive accuracy from gps
                 "", // rcoi blank
                 "", // todo - fill bt mfgr id
@@ -412,14 +413,17 @@ int kis_wiglecsv_logfile::packet_handler(CHAINCALL_PARMS) {
                 0,
                 "", // todo - fill in device type code
                 signal,
-                gps->lat, gps->lon, gps->alt,
+                in_pack->gps_info.lat, in_pack->gps_info.lon, in_pack->gps_info.alt,
                 0, // todo - derive accuracy from gps
                 "", // rcoi blank
                 "", // todo - fill bt mfgr id
                 type);
     }
 
-    wigle->timer_map[dev->get_key()] = time(0) + wigle->throttle_seconds;
+    {
+        kis_lock_guard<kis_mutex> tlk(wigle->timer_mutex, "wigle timer_map");
+        wigle->timer_map[dev->get_key()] = time(0) + wigle->throttle_seconds;
+    }
 
     fflush(wigle->csvfile);
 

@@ -44,11 +44,12 @@ protected:
 
     FILE *csvfile;
 
-    int pack_comp_80211, pack_comp_gps, pack_comp_l1info,
-        pack_comp_device;
+    int pack_comp_80211, pack_comp_device;
 
     unsigned int throttle_seconds;
 
+    // Per-device throttle; written by any packet thread
+    kis_mutex timer_mutex;
     std::unordered_map<device_key, time_t> timer_map;
 
     std::shared_ptr<device_tracker> devicetracker;

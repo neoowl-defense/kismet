@@ -330,13 +330,20 @@ kismet_ui.AddDeviceColumn("packet_rrd", {
             });
 
         onrender(() => {
+            // Highlighted rows pick their own text colour; draw the graph to match
+            var color = kismet_theme.sparkline_main;
+            var rowel = cell.getRow().getElement();
+
+            if (rowel.classList.contains('k-row-highlight'))
+                color = getComputedStyle(rowel).color;
+
             $(cell.getElement()).sparkline(simple_rrd,
                 { type: "bar",
                     width: "100px",
                     height: 12,
-                    barColor: kismet_theme.sparkline_main,
-                    nullColor: kismet_theme.sparkline_main,
-                    zeroColor: kismet_theme.sparkline_main,
+                    barColor: color,
+                    nullColor: color,
+                    zeroColor: color,
                 });
         });
 
@@ -1035,6 +1042,67 @@ kismet_ui.AddDeviceDetail("base", "Device Info", -1000, {
                         }
                     },
                 }
+                ],
+            },
+
+            {
+                // Where the device says it is (ADS-B, AIS, Remote ID...); the
+                // average location above is where Kismet was when it heard it
+                groupTitle: "Reported Location",
+                field: "group_reported_location",
+                id: "group_reported_location",
+
+                filter: function(opts) {
+                    return (kismet.ObjectByString(opts['data'], "kismet.device.base.reported_location/kismet.common.location.last/kismet.common.location.fix") >= 2);
+                },
+
+                fields: [
+                {
+                    field: "kismet.device.base.reported_location/kismet.common.location.last/kismet.common.location.geopoint",
+                    title: "Last reported",
+                    help: "The position the device reported for itself most recently.",
+                    liveupdate: true,
+                    draw: function(opts) {
+                        try {
+                            if (opts['value'][1] == 0 || opts['value'][0] == 0)
+                                return "<i>Unknown</i>";
+
+                            return kismet.censorLocation(opts['value'][1]) + ", " + kismet.censorLocation(opts['value'][0]);
+                        } catch (error) {
+                            return "<i>Unknown</i>";
+                        }
+                    }
+                },
+                {
+                    field: "kismet.device.base.reported_location/kismet.common.location.last/kismet.common.location.alt",
+                    title: "Altitude",
+                    liveupdate: true,
+                    filter: function(opts) {
+                        return (kismet.ObjectByString(opts['data'], "kismet.device.base.reported_location/kismet.common.location.last/kismet.common.location.fix") >= 3);
+                    },
+                    draw: function(opts) {
+                        try {
+                            return kismet_ui.renderHeightDistance(opts['value']);
+                        } catch (error) {
+                            return "<i>Unknown</i>";
+                        }
+                    },
+                },
+                {
+                    field: "kismet.device.base.reported_location/kismet.common.location.avg_loc/kismet.common.location.geopoint",
+                    title: "Average",
+                    liveupdate: true,
+                    draw: function(opts) {
+                        try {
+                            if (opts['value'][1] == 0 || opts['value'][0] == 0)
+                                return "<i>Unknown</i>";
+
+                            return kismet.censorLocation(opts['value'][1]) + ", " + kismet.censorLocation(opts['value'][0]);
+                        } catch (error) {
+                            return "<i>Unknown</i>";
+                        }
+                    }
+                },
                 ],
             }
             ]

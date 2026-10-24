@@ -241,6 +241,7 @@ int probe_callback(kis_capture_handler_t *caph, uint32_t seqno,
 
     /* Look for the interface type */
     if (strstr(interface, "freaklabs") != interface) {
+        snprintf(msg, STATUS_MAX, "Didn't find a freaklabs interface, skipping");
         free(interface);
         return 0;
     }
@@ -248,8 +249,7 @@ int probe_callback(kis_capture_handler_t *caph, uint32_t seqno,
     if ((placeholder_len = cf_find_flag(&placeholder, "device", definition)) > 0) {
         device = strndup(placeholder, placeholder_len);
     } else {
-        snprintf(msg, STATUS_MAX,
-            "Expected device= path to serial device in definition");
+        snprintf(msg, STATUS_MAX, "Expected device= path to serial device in definition");
         return 0;
     }
 

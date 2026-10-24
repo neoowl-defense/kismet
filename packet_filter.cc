@@ -53,7 +53,7 @@ packet_filter::packet_filter(const std::string& in_id, const std::string& in_des
 
     auto posturl = fmt::format("{}/set_default", base_uri);
 
-    httpd->register_route(url, {"POST"}, httpd->LOGON_ROLE, {"cmd"},
+    httpd->register_route(posturl, {"POST"}, httpd->LOGON_ROLE, {"cmd"},
             std::make_shared<kis_net_web_function_endpoint>(
                 [this, posturl](std::shared_ptr<kis_net_beast_httpd_connection> con) {
                     kis_lock_guard<kis_mutex> lk(mutex, posturl);
@@ -432,7 +432,7 @@ bool packet_filter_mac_addr::filter_packet(std::shared_ptr<kis_packet> packet) {
 }
 
 bool packet_filter_mac_addr::filter_packet(const kis_packet* packet) {
-    if (!packet->common_info_ok)
+    if (!packet->common_info.common_info_ok)
         return get_filter_default();
 
     auto phy_filter_group =

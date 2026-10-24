@@ -377,11 +377,13 @@ int probe_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition
 
     /* is it an ubertooth? */
     if (strcmp("ubertooth", interface) == 0) {
+        snprintf(msg, STATUS_MAX, "Didn't find an Ubertooth interface, skipping");
         parse_num = -1;
         free(interface);
         return 0;
     } else if ((ret = sscanf(interface, "ubertooth%u", &parse_num)) != 1) {
         if ((ret = sscanf(interface, "ubertooth-%u", &parse_num)) != 1) {
+            snprintf(msg, STATUS_MAX, "Expected ubertoothX or ubertooth-X, skipping");
             free(interface);
             return 0;
         }

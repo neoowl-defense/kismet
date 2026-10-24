@@ -20,7 +20,7 @@
 
 #include "datasource_ubertooth_one.h"
 
-int kis_datasource_ubertooth_one::handle_rx_data_content(kis_packet *packet, kis_datachunk *datachunk,
+kis_datasource_ubertooth_one::rx_content kis_datasource_ubertooth_one::handle_rx_data_content(kis_packet *packet, kis_datachunk *datachunk,
             const uint8_t *content, size_t content_sz) {
     typedef struct {
         uint8_t monitor_channel;
@@ -62,7 +62,7 @@ int kis_datasource_ubertooth_one::handle_rx_data_content(kis_packet *packet, kis
         // error, but preserve the packet for logging
         packet->set_data((const char *) content, content_sz);
         datachunk->set_data(packet->data);
-        return 1;
+        return rx_content::frame;
     }
 
     const auto usb_rx = reinterpret_cast<const usb_pkt_rx *>(content);
@@ -74,7 +74,7 @@ int kis_datasource_ubertooth_one::handle_rx_data_content(kis_packet *packet, kis
         // error, but preserve the packet for logging
         packet->set_data((const char *) content, content_sz);
         datachunk->set_data(packet->data);
-        return 1;
+        return rx_content::frame;
     }
 
 
@@ -121,12 +121,11 @@ int kis_datasource_ubertooth_one::handle_rx_data_content(kis_packet *packet, kis
     datachunk->set_data(packet->data);
 
     // Generate a l1 radio header and a decap header since we have it computed already
-    auto radioheader = packetchain->new_packet_component<kis_layer1_packinfo>();
-    radioheader->signal_type = kis_l1_signal_type_dbm;
-    radioheader->signal_dbm = conv_header->signal;
-    radioheader->freq_khz = (usb_rx->channel + 2402) * 1000;
-    radioheader->channel = fmt::format("{}", conv_header->monitor_channel);
-    packet->insert(pack_comp_radiodata, radioheader);
+	packet->signal_info.data_ok = true;
+    packet->signal_info.signal_type = kis_l1_signal_type_dbm;
+    packet->signal_info.signal_dbm = conv_header->signal;
+    packet->signal_info.freq_khz = (usb_rx->channel + 2402) * 1000;
+    packet->signal_info.channel = fmt::format("{}", conv_header->monitor_channel);
 
 
     auto decapchunk = packetchain->new_packet_component<kis_datachunk>();
@@ -134,6 +133,6 @@ int kis_datasource_ubertooth_one::handle_rx_data_content(kis_packet *packet, kis
     decapchunk->set_data(packet->data.substr(sizeof(btle_rf), payload_len));
     packet->insert(pack_comp_decap, decapchunk);
 
-    return 1;
+    return rx_content::frame;
 }
 

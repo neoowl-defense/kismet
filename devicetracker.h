@@ -34,6 +34,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+#include <functional>
 #include <stdexcept>
 #include <utility>
 
@@ -183,11 +184,32 @@ public:
 #define UCD_UPDATE_EMPTY_SIGNAL     (1 << 7)
 // Only update location if we have no existing location
 #define UCD_UPDATE_EMPTY_LOCATION   (1 << 8)
+// Update the location the device reports for itself, from the packet's
+// reported_gps, into the device's reported_location
+#define UCD_UPDATE_REPORTED_LOCATION    (1 << 9)
 
     std::shared_ptr<kis_tracked_device_base> update_common_device(
             const mac_addr& in_mac, kis_phy_handler *phy,
             const std::shared_ptr<kis_packet>& in_pack, unsigned int in_flags,
             const std::string& in_basic_type);
+
+    // Add a packet's position to one of a device's location sets
+    void update_location_set(const std::shared_ptr<kis_tracked_location>& loc,
+            const kis_gps_packinfo& gps, const std::shared_ptr<kis_packet>& in_pack,
+            const std::function<std::shared_ptr<kis_location_rrd> ()>& get_cloud);
+
+    std::shared_ptr<kis_tracked_device_base> update_common_device(
+            const mac_addr& in_mac, kis_phy_handler *phy,
+            const std::shared_ptr<kis_packet>& in_pack, unsigned int in_flags,
+            const std::string& in_basic_type, bool& new_device);
+
+    // As above, but the device is returned still locked exclusively by held_lock, so a phy
+    // can finish its own update of the device without locking it a second time.  held_lock
+    // must be unbound, and is left unbound when no device is returned.
+    std::shared_ptr<kis_tracked_device_base> update_common_device(
+            const mac_addr& in_mac, kis_phy_handler *phy,
+            const std::shared_ptr<kis_packet>& in_pack, unsigned int in_flags,
+            const std::string& in_basic_type, kis_device_lock& held_lock);
 
     // Set the common name of a device (and log it in the database for future runs)
     void set_device_user_name(std::shared_ptr<kis_tracked_device_base> in_dev,
@@ -196,6 +218,10 @@ public:
     // Set an arbitrary tag (and log it in the database for future runs)
     void set_device_tag(std::shared_ptr<kis_tracked_device_base> in_dev,
             const std::string& in_tag, const std::string& in_content);
+
+    // Remove a tag (and from the database); returns false if the device had no such tag
+    bool remove_device_tag(std::shared_ptr<kis_tracked_device_base> in_dev,
+            const std::string& in_tag);
 
     // CLI extension
     static void usage(const char *name);
@@ -209,6 +235,7 @@ public:
 
     // Database API
     virtual int database_upgrade_db() override;
+    virtual void database_close() override;
 
     // Store all devices to the database
     virtual void databaselog_write_devices();
@@ -309,8 +336,7 @@ protected:
 	int devcomp_ref_common;
 
     // Packet components we add or interact with
-    int pack_comp_device, pack_comp_basicdata,
-        pack_comp_radiodata, pack_comp_gps, pack_comp_datasrc,
+    int pack_comp_device, pack_comp_basicdata, pack_comp_datasrc,
         pack_comp_mangleframe, pack_comp_devicetag;
 
 
@@ -324,6 +350,9 @@ protected:
     // 2 = lost only
     // 3 = seen and lost
     std::map<mac_addr, unsigned int> macdevice_alert_conf_map;
+    // Protects macdevice_alert_conf_map and macdevice_flagged_vec; nothing else is
+    // locked while it's held
+    kis_mutex macdevice_mutex;
     // Timeout event
     int macdevice_alert_timeout_timer;
     // Trigger event called to see if we need to alert devices have
@@ -348,8 +377,37 @@ protected:
     // device ID.
     std::shared_ptr<tracker_element_vector> immutable_tracked_vec;
 
-    // List of views using new API as we transition the rest to the new API
+    // List of views using new API as we transition the rest to the new API; modified
+    // under the device list lock
     std::shared_ptr<tracker_element_vector> view_vec;
+
+    // Copy of view_vec rebuilt whenever it changes, so per-packet view updates can walk
+    // the views without holding a lock that would order before device locks
+    using view_snapshot_t = std::shared_ptr<const std::vector<std::shared_ptr<tracker_element>>>;
+    kis_mutex view_snapshot_mutex;
+    view_snapshot_t view_snapshot;
+
+    view_snapshot_t get_view_snapshot() {
+        kis_lock_guard<kis_mutex> lk(view_snapshot_mutex, "device_tracker view snapshot");
+        return view_snapshot;
+    }
+
+    // Caller holds the device list lock
+    void rebuild_view_snapshot() {
+        auto v = std::make_shared<std::vector<std::shared_ptr<tracker_element>>>(view_vec->begin(), view_vec->end());
+        kis_lock_guard<kis_mutex> lk(view_snapshot_mutex, "device_tracker view snapshot");
+        view_snapshot = v;
+    }
+
+    std::shared_ptr<kis_tracked_device_base> update_common_device_impl(
+            const mac_addr& in_mac, kis_phy_handler *phy,
+            const std::shared_ptr<kis_packet>& in_pack, unsigned int in_flags,
+            const std::string& in_basic_type, bool& new_device, kis_device_lock& held_lock);
+
+    // Common device update for a device the caller has locked
+    void update_common_device_locked(const std::shared_ptr<kis_tracked_device_base>& device,
+            const mac_addr& in_mac, const std::shared_ptr<kis_packet>& in_pack,
+            unsigned int in_flags, bool new_device);
 
     using shared_con = std::shared_ptr<kis_net_beast_httpd_connection>;
     std::shared_ptr<tracker_element> multimac_endp_handler(shared_con con);
@@ -364,7 +422,7 @@ protected:
 	// Registered PHY types
 	int next_phy_id;
     ankerl::unordered_dense::map<int, kis_phy_handler *> phy_handler_map;
-    kis_mutex phy_mutex;
+    kis_shared_mutex phy_mutex;
 
     // New multimutex primitive
     kis_mutex devicelist_mutex;
@@ -389,11 +447,26 @@ protected:
     // Insert a device directly into the records
     void add_device(std::shared_ptr<kis_tracked_device_base> device);
 
-    // Load stored username
-    void load_stored_username(std::shared_ptr<kis_tracked_device_base> in_dev);
+    // Stored name and tags for a device key, looked up before a device is created so the
+    // queries don't run under the device list lock
+    struct stored_device_info {
+        bool has_name = false;
+        std::string name;
+        std::vector<std::pair<std::string, std::string>> tags;
+    };
 
-    // Load stored tags
-    void load_stored_tags(std::shared_ptr<kis_tracked_device_base> in_dev);
+    void lookup_stored_name(const std::string& keystring, stored_device_info& info);
+    void lookup_stored_tags(const std::string& keystring, stored_device_info& info);
+
+    // Stored name and tag queries run for every new device, so they're prepared once
+    // per database handle; ds_mutex must be held, and they're finalized before the
+    // handle is closed
+    sqlite3_stmt *stored_name_stmt = nullptr;
+    sqlite3_stmt *stored_tags_stmt = nullptr;
+    sqlite3 *stored_stmt_db = nullptr;
+
+    sqlite3_stmt *get_stored_stmt(sqlite3_stmt*& stmt, const char *sql);
+    void finalize_stored_stmts();
 
     // Cached device type map
     std::map<std::string, std::shared_ptr<tracker_element_string>> device_type_cache;

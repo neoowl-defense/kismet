@@ -23,6 +23,13 @@
 #include "timetracker.h"
 #include "gpstracker.h"
 
+namespace {
+    template<typename T>
+    struct elem_tag {
+        using type = T;
+    };
+}
+
 kis_gps::kis_gps(shared_gps_builder in_builder, uint64_t in_id) :
     tracker_component() {
 
@@ -86,11 +93,15 @@ bool kis_gps::open_gps(std::string in_definition) {
         }
     }
 
-    std::string sname = fetch_opt("name", source_definition_opts);
-    if (sname != "") {
-        set_int_gps_name(gpstracker->find_next_name(sname));
-    } else {
-        set_int_gps_name(gpstracker->find_next_name(gps_prototype->get_default_name()));
+    // A reconnect reopens with the same definition; keep the name instead of finding
+    // our own name in use and picking a new one
+    if (get_gps_name().empty()) {
+        std::string sname = fetch_opt("name", source_definition_opts);
+        if (sname != "") {
+            set_int_gps_name(gpstracker->find_next_name(sname));
+        } else {
+            set_int_gps_name(gpstracker->find_next_name(gps_prototype->get_default_name()));
+        }
     }
 
     std::string suuid = fetch_opt("uuid", source_definition_opts);
@@ -126,8 +137,10 @@ bool kis_gps::open_gps(std::string in_definition) {
         if (sscanf(sprio.c_str(), "%d", &priority) != 1) {
             _MSG("Invalid priority passed in GPS definition as priority=... for " + 
                     get_gps_name(), MSGFLAG_FATAL);
-            set_int_gps_priority(priority);
+            return false;
         }
+
+        set_int_gps_priority(priority);
     } else {
         set_int_gps_priority(gps_prototype->get_gps_priority());
     }
@@ -224,6 +237,329 @@ double kis_gps::gps_calc_rad(double lat) {
 
     r = r * 1000.0;
     return r;
+}
+
+void kis_gps::apply_fix(const gps_fix_update& update) {
+    if (update.empty()) {
+        if (!update.quality.empty())
+            apply_quality(update.quality);
+
+        return;
+    }
+
+    auto loc = packetchain->new_packet_component<kis_gps_packinfo>();
+
+    struct timeval now;
+    gettimeofday(&now, nullptr);
+
+    kis_lock_guard<kis_mutex> lk(data_mutex, "gps apply_fix");
+
+    const auto prev = gps_location;
+
+    merge_quality(update.quality, now.tv_sec);
+
+    // A fix mode report which matches the current fix doesn't refresh the location, and a
+    // no fix report before any location doesn't create one
+    if (update.fix_reported && !update.has_position && !update.has_alt && !update.has_speed &&
+            !update.has_heading && !update.has_magheading &&
+            ((prev->gps_info_ok && prev->fix == update.fix) || (!prev->gps_info_ok && update.fix < 2))) {
+        fix_reported_time = now.tv_sec;
+        set_int_gps_data_time(now.tv_sec);
+        publish_quality(now.tv_sec);
+        return;
+    }
+
+    // Fields this report doesn't carry come from the previous report
+    loc->set(prev);
+
+    if (update.has_position) {
+        loc->lat = update.lat;
+        loc->lon = update.lon;
+    }
+
+    if (update.has_alt)
+        loc->alt = update.alt;
+
+    if (update.has_speed)
+        loc->speed = update.speed;
+
+    if (update.has_heading) {
+        loc->heading = update.heading;
+        fix_heading_time = now.tv_sec;
+    }
+
+    if (update.has_magheading) {
+        loc->magheading = update.magheading;
+        fix_heading_time = now.tv_sec;
+    }
+
+    if (update.has_fix && update.fix_reported) {
+        loc->fix = update.fix;
+        fix_reported_time = now.tv_sec;
+    } else if (update.has_fix && now.tv_sec - fix_reported_time > fix_reported_stale) {
+        // Keep a better fix from another sentence in this reporting cycle, but not a stale one
+        const int64_t age_us = (static_cast<int64_t>(now.tv_sec) - prev->tv.tv_sec) * 1000000 +
+            (now.tv_usec - prev->tv.tv_usec);
+
+        const bool prev_recent = prev->gps_info_ok && age_us >= 0 && age_us < 1000000;
+        loc->fix = std::max(update.fix, prev_recent ? prev->fix : 0);
+    }
+
+    if (update.has_position && !update.has_heading && prev->fix >= 2 &&
+            now.tv_sec - fix_heading_time > 5) {
+        loc->heading = gps_calc_heading(loc->lat, loc->lon, prev->lat, prev->lon);
+        fix_heading_time = now.tv_sec;
+    }
+
+    loc->gps_info_ok = true;
+    loc->tv = now;
+    loc->gps_id = gps_id;
+
+    bool reported;
+    loc->precision = loc->fix >= 2 ? quality_precision(false, reported) : 0;
+
+    gps_last_location = prev;
+    gps_location = loc;
+
+    update_locations();
+    publish_quality(now.tv_sec);
+}
+
+void kis_gps::apply_quality(const gps_quality_update& update) {
+    const time_t now = time(0);
+
+    kis_lock_guard<kis_mutex> lk(data_mutex, "gps apply_quality");
+
+    merge_quality(update, now);
+    set_int_gps_data_time(now);
+    publish_quality(now);
+}
+
+void kis_gps::clear_quality() {
+    kis_lock_guard<kis_mutex> lk(data_mutex, "gps clear_quality");
+
+    quality_state = {};
+    satellites_state.clear();
+    satellites_meta = {};
+
+    for (auto id : {sats_used_id, sats_visible_id, hdop_id, vdop_id, precision_h_id,
+            precision_v_id, precision_source_id, signal_cn0_id, signal_quality_id, satellites_id})
+        clear_quality_field(id);
+}
+
+void kis_gps::merge_quality(const gps_quality_update& update, time_t now) {
+    if (update.empty())
+        return;
+
+    expire_quality(now);
+
+    auto merge = [&](bool has, quality_field f, double v) {
+        if (!has)
+            return;
+
+        auto& q = quality_at(f);
+
+        // A binary report outranks NMEA until it goes stale
+        if (q.present && update.rank < q.rank)
+            return;
+
+        q.present = true;
+        q.value = v;
+        q.time = now;
+        q.rank = update.rank;
+    };
+
+    merge(update.has_sats_used, quality_field::sats_used, update.sats_used);
+    merge(update.has_sats_visible, quality_field::sats_visible, update.sats_visible);
+    merge(update.has_hdop, quality_field::hdop, update.hdop);
+    merge(update.has_vdop, quality_field::vdop, update.vdop);
+    merge(update.has_error_h, quality_field::error_h, update.error_h);
+    merge(update.has_error_v, quality_field::error_v, update.error_v);
+    merge(update.has_cn0, quality_field::cn0, update.cn0);
+
+    if (update.has_satellites && !(satellites_meta.present && update.rank < satellites_meta.rank)) {
+        satellites_state = update.satellites;
+        satellites_meta.present = true;
+        satellites_meta.time = now;
+        satellites_meta.rank = update.rank;
+    }
+}
+
+void kis_gps::expire_quality(time_t now) {
+    for (auto& q : quality_state) {
+        if (q.present && (now - q.time > quality_expire || now < q.time))
+            q = {};
+    }
+
+    if (satellites_meta.present && (now - satellites_meta.time > quality_expire || now < satellites_meta.time)) {
+        satellites_meta = {};
+        satellites_state.clear();
+    }
+}
+
+double kis_gps::quality_precision(bool vertical, bool& reported) {
+    const auto& err = quality_at(vertical ? quality_field::error_v : quality_field::error_h);
+    const auto& dop = quality_at(vertical ? quality_field::vdop : quality_field::hdop);
+
+    if (err.present && err.value > 0) {
+        reported = true;
+        return err.value;
+    }
+
+    if (dop.present && dop.value > 0) {
+        reported = false;
+        return dop.value * estimated_uere;
+    }
+
+    return 0;
+}
+
+void kis_gps::publish_quality(time_t now) {
+    expire_quality(now);
+
+    const auto& used = quality_at(quality_field::sats_used);
+    const auto& visible = quality_at(quality_field::sats_visible);
+    const auto& hdop = quality_at(quality_field::hdop);
+    const auto& vdop = quality_at(quality_field::vdop);
+    const auto& cn0 = quality_at(quality_field::cn0);
+
+    auto publish = [this](uint16_t id, const quality_value& q, auto as) {
+        using T = typename decltype(as)::type;
+
+        if (!q.present)
+            clear_quality_field(id);
+        else if constexpr (std::is_same<T, tracker_element_uint8>::value)
+            set_quality_field<T>(id, static_cast<uint8_t>(std::min(q.value, 255.0)));
+        else
+            set_quality_field<T>(id, q.value);
+    };
+
+    publish(sats_used_id, used, elem_tag<tracker_element_uint8>{});
+    publish(sats_visible_id, visible, elem_tag<tracker_element_uint8>{});
+    publish(hdop_id, hdop, elem_tag<tracker_element_double>{});
+    publish(vdop_id, vdop, elem_tag<tracker_element_double>{});
+    publish(signal_cn0_id, cn0, elem_tag<tracker_element_double>{});
+
+    if (!satellites_meta.present) {
+        clear_quality_field(satellites_id);
+    } else {
+        // A new list each time, so a serializer holding the old one isn't changed under it
+        auto sats = Globalreg::globalreg->entrytracker->get_shared_instance_as<tracker_element_vector>(satellites_id);
+        sats->reserve(satellites_state.size());
+
+        for (const auto& sat : satellites_state) {
+            auto e = Globalreg::globalreg->entrytracker->get_shared_instance_as<kis_gps_satellite>(satellite_entry_id);
+            e->set(sat);
+            sats->push_back(e);
+        }
+
+        auto ci = find(satellites_id);
+        if (ci != end())
+            erase(ci);
+        insert(sats);
+    }
+
+    // Same validity the drivers use for the location
+    const bool recent = gps_location != nullptr && gps_location->gps_info_ok &&
+        now - gps_location->tv.tv_sec <= 10;
+    const int fix = recent ? gps_location->fix : 0;
+
+    bool h_reported = false;
+    bool v_reported = false;
+    const double prec_h = fix >= 2 ? quality_precision(false, h_reported) : 0;
+    const double prec_v = fix >= 3 ? quality_precision(true, v_reported) : 0;
+
+    if (prec_h > 0)
+        set_quality_field<tracker_element_double>(precision_h_id, prec_h);
+    else
+        clear_quality_field(precision_h_id);
+
+    if (prec_v > 0)
+        set_quality_field<tracker_element_double>(precision_v_id, prec_v);
+    else
+        clear_quality_field(precision_v_id);
+
+    if (prec_h > 0 || prec_v > 0) {
+        const bool all_reported = (prec_h <= 0 || h_reported) && (prec_v <= 0 || v_reported);
+        const bool all_estimated = (prec_h <= 0 || !h_reported) && (prec_v <= 0 || !v_reported);
+
+        set_quality_field<tracker_element_string>(precision_source_id,
+                std::string(all_reported ? "reported" : all_estimated ? "estimated" : "mixed"));
+    } else {
+        clear_quality_field(precision_source_id);
+    }
+
+    // Known to be 0 while the GPS reports without a fix; unknown if it reports nothing
+    const bool any = used.present || visible.present || hdop.present || cn0.present;
+    const int score = gps_signal_quality_score(fix,
+            cn0.present ? cn0.value : -1, hdop.present ? hdop.value : 0,
+            used.present ? static_cast<int>(used.value) : -1);
+
+    if (score >= 0 && (fix >= 2 || any || recent))
+        set_quality_field<tracker_element_uint8>(signal_quality_id, static_cast<uint8_t>(score));
+    else
+        clear_quality_field(signal_quality_id);
+}
+
+void kis_gps::add_signal_report(tracker_component& report) {
+    kis_lock_guard<kis_mutex> lk(data_mutex, "gps add_signal_report");
+
+    publish_quality(time(0));
+
+    auto copy = [this, &report](uint16_t id, auto as) {
+        using T = typename decltype(as)::type;
+
+        const auto ci = find(id);
+        if (ci == end())
+            return;
+
+        auto e = Globalreg::globalreg->entrytracker->get_shared_instance_as<T>(id);
+        e->set(std::static_pointer_cast<T>(ci->second)->get());
+        report.insert(e);
+    };
+
+    copy(sats_used_id, elem_tag<tracker_element_uint8>{});
+    copy(sats_visible_id, elem_tag<tracker_element_uint8>{});
+    copy(hdop_id, elem_tag<tracker_element_double>{});
+    copy(vdop_id, elem_tag<tracker_element_double>{});
+    copy(precision_h_id, elem_tag<tracker_element_double>{});
+    copy(precision_v_id, elem_tag<tracker_element_double>{});
+    copy(precision_source_id, elem_tag<tracker_element_string>{});
+    copy(signal_cn0_id, elem_tag<tracker_element_double>{});
+    copy(signal_quality_id, elem_tag<tracker_element_uint8>{});
+}
+
+std::shared_ptr<tracker_element_map> kis_gps::satellite_snapshot() {
+    kis_lock_guard<kis_mutex> lk(data_mutex, "gps satellite_snapshot");
+
+    expire_quality(time(0));
+
+    if (!satellites_meta.present || find(satellites_id) == end())
+        return nullptr;
+
+    auto snap = std::make_shared<tracker_element_map>();
+
+    for (auto id : {gps_uuid->get_id(), gps_name->get_id(), sats_used_id, sats_visible_id, hdop_id,
+            vdop_id, precision_h_id, precision_v_id, signal_cn0_id, signal_quality_id, satellites_id}) {
+        const auto ci = find(id);
+        if (ci != end())
+            snap->insert(ci->second);
+    }
+
+    return snap;
+}
+
+std::shared_ptr<tracker_element_map> kis_gps::track_snapshot() {
+    kis_lock_guard<kis_mutex> lk(data_mutex, "gps track_snapshot");
+
+    auto snap = std::make_shared<tracker_element_map>();
+
+    for (const auto& e : *this) {
+        if (e.first != satellites_id)
+            snap->insert(e.second);
+    }
+
+    return snap;
 }
 
 void kis_gps::update_locations() {

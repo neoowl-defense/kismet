@@ -339,6 +339,7 @@ int probe_callback(kis_capture_handler_t *caph, uint32_t seqno,
 
     /* Look for the interface type */
     if (strstr(interface, "nxp_kw41z") != interface) {
+        snprintf(msg, STATUS_MAX, "Expected nxp_kw41z interface, skipping");
         free(interface);
         return 0;
     }

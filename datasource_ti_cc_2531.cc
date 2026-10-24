@@ -18,7 +18,7 @@
 
 #include "datasource_ti_cc_2531.h"
 
-int kis_datasource_ticc2531::handle_rx_data_content(kis_packet *packet, kis_datachunk *datachunk,
+kis_datasource_ticc2531::rx_content kis_datasource_ticc2531::handle_rx_data_content(kis_packet *packet, kis_datachunk *datachunk,
         const uint8_t *content, size_t content_sz) {
 
     // If we can't validate the basics of the packet at the phy capture level, throw it out.
@@ -28,7 +28,7 @@ int kis_datasource_ticc2531::handle_rx_data_content(kis_packet *packet, kis_data
         // error, but preserve the packet for logging
         packet->set_data((const char *) content, content_sz);
         datachunk->set_data(packet->data);
-        return 1;
+        return rx_content::frame;
     }
 
     unsigned int cc_len = content[1];
@@ -37,15 +37,16 @@ int kis_datasource_ticc2531::handle_rx_data_content(kis_packet *packet, kis_data
         // error, but preserve the packet for logging
         packet->set_data((const char *) content, content_sz);
         datachunk->set_data(packet->data);
-        return 1;
+        return rx_content::frame;
     }
 
     unsigned int cc_payload_len = content[7] - 0x02;
     if ((cc_payload_len + 8 != content_sz - 2) || (cc_payload_len > 104)) {
+        packet->error = 1;
         // error, but preserve the packet for logging
         packet->set_data((const char *) content, content_sz);
         datachunk->set_data(packet->data);
-        return 1;
+        return rx_content::frame;
     }
 
     uint8_t fcs1 = content[content_sz - 2];
@@ -68,26 +69,8 @@ int kis_datasource_ticc2531::handle_rx_data_content(kis_packet *packet, kis_data
         // Copy the actual packet payload into the header
         memcpy(conv_header->payload, &content[8], cc_payload_len);
 
-        conv_header->version = kis_htole16(0);// currently only one version
-        conv_header->reserved = kis_htole16(0);// must be set to 0
-
-        // fcs setting
-        conv_header->tlv[0].type = kis_htole16(0);
-        conv_header->tlv[0].length = kis_htole16(1);
-        conv_header->tlv[0].value = kis_htole32(0);
-
-        // rssi
-        conv_header->tlv[1].type = kis_htole16(10);
-        conv_header->tlv[1].length = kis_htole16(1);
-        conv_header->tlv[1].value = kis_htole32(rssi);
-
-        // channel
-        conv_header->tlv[2].type = kis_htole16(3);
-        conv_header->tlv[2].length = kis_htole16(3);
-        conv_header->tlv[2].value = kis_htole32(channel);
-
-        //size
-        conv_header->length = sizeof(_802_15_4_tap);
+        // no FCS (the radio's status bytes replace it), the RSSI in dBm, the channel
+        tap_802_15_4_fill(conv_header, 0, 1, (float) rssi, 0, channel);
 
         datachunk->dlt = KDLT_IEEE802_15_4_TAP;
 
@@ -95,20 +78,19 @@ int kis_datasource_ticc2531::handle_rx_data_content(kis_packet *packet, kis_data
         packet->set_data((const char *) conv_buf, conv_buf_len);
         datachunk->set_data(packet->data);
 
-        auto radioheader = packetchain->new_packet_component<kis_layer1_packinfo>();
-        radioheader->signal_type = kis_l1_signal_type_dbm;
-        radioheader->signal_dbm = rssi;
-        radioheader->freq_khz = (2405 + ((channel - 11) * 5)) * 1000;
-        radioheader->channel = fmt::format("{}", (channel));
-        packet->insert(pack_comp_radiodata, radioheader);
+		packet->signal_info.data_ok = true;
+        packet->signal_info.signal_type = kis_l1_signal_type_dbm;
+        packet->signal_info.signal_dbm = rssi;
+        packet->signal_info.freq_khz = (2405 + ((channel - 11) * 5)) * 1000;
+        packet->signal_info.channel = fmt::format("{}", (channel));
 
-        return 1;
+        return rx_content::frame;
     } else {
         packet->error = 1;
         // error, but preserve the packet for logging
         packet->set_data((const char *) content, content_sz);
         datachunk->set_data(packet->data);
-        return 1;
+        return rx_content::frame;
     }
 }
 

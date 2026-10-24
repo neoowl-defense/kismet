@@ -55,6 +55,7 @@
 #include <future>
 #include <exception>
 #include <string_view>
+#include <type_traits>
 
 #include <sys/time.h>
 
@@ -84,7 +85,65 @@ std::string str_strip(const std::string& in_str);
 
 std::string multi_replace_all(const std::string& in, const std::string& match, const std::string& repl);
 
-int hex_str_to_uint8(const std::string& in_str, uint8_t *in_buf, int in_buflen);
+// Natural order compare (2_foo < 10_foo); digit runs are compared by length then
+// digits so long numbers can't overflow, and ties fall back to byte order
+constexpr int natural_compare(std::string_view a, std::string_view b) {
+    auto is_digit = [](char c) { return c >= '0' && c <= '9'; };
+    size_t ai = 0, bi = 0;
+
+    while (ai < a.size() && bi < b.size()) {
+        if (is_digit(a[ai]) && is_digit(b[bi])) {
+            while (ai < a.size() && a[ai] == '0')
+                ai++;
+            while (bi < b.size() && b[bi] == '0')
+                bi++;
+
+            const auto as = ai, bs = bi;
+
+            while (ai < a.size() && is_digit(a[ai]))
+                ai++;
+            while (bi < b.size() && is_digit(b[bi]))
+                bi++;
+
+            if (ai - as != bi - bs)
+                return (ai - as) < (bi - bs) ? -1 : 1;
+
+            for (size_t i = 0; i < ai - as; i++) {
+                if (a[as + i] != b[bs + i])
+                    return a[as + i] < b[bs + i] ? -1 : 1;
+            }
+
+            continue;
+        }
+
+        if (a[ai] != b[bi])
+            return static_cast<unsigned char>(a[ai]) < static_cast<unsigned char>(b[bi]) ? -1 : 1;
+
+        ai++;
+        bi++;
+    }
+
+    if (ai < a.size())
+        return 1;
+    if (bi < b.size())
+        return -1;
+
+    const auto r = a.compare(b);
+    return r < 0 ? -1 : (r > 0 ? 1 : 0);
+}
+
+static_assert(natural_compare("1_foo", "2_foo") < 0);
+static_assert(natural_compare("2_foo", "10_foo") < 0);
+static_assert(natural_compare("10_foo", "11_foo") < 0);
+static_assert(natural_compare("11_foo", "2_foo") > 0);
+static_assert(natural_compare("a2", "a10") < 0);
+static_assert(natural_compare("abc", "abd") < 0);
+static_assert(natural_compare("a", "a1") < 0);
+static_assert(natural_compare("01_a", "1_a") < 0);
+static_assert(natural_compare("1_a", "01_a") > 0);
+static_assert(natural_compare("10_foo", "10_foo") == 0);
+static_assert(natural_compare("99999999999999999999999_a", "100000000000000000000000_a") < 0);
+
 std::string uint8_to_hex_str(uint8_t *in_buf, int in_buflen);
 
 template<class t> 
@@ -194,14 +253,15 @@ std::vector<smart_word_token> base_str_tokenize(const std::string& in_str,
 // of the token, no abc"def ghi"
 std::vector<std::string> quote_str_tokenize(const std::string& in_str, const std::string& in_split);
 
-int TokenNullJoin(std::string *ret_str, const char **in_list);
+// Smart tokenizer that uses zero-copy string views
+std::vector<std::string_view> base_sv_tokenize(const std::string_view& in_str,
+        const std::string& in_split, const std::string& in_quote);
+
+std::vector<std::string_view> quote_sv_tokenize(const std::string_view& in_str,
+        const std::string& in_split);
 
 std::string in_line_wrap(const std::string& in_txt, unsigned int in_hdr_len, unsigned int in_max_len);
 std::vector<std::string> line_wrap(const std::string& in_txt, unsigned int in_hdr_len, unsigned int in_maxlen);
-std::vector<int> str_to_int_vector(const std::string& in_text);
-
-void float_to_pair(float in_float, int16_t *primary, int64_t *mantissa);
-float pair_to_float(int16_t primary, int64_t mantissa);
 
 #ifdef SYS_LINUX
 int fetch_sys_loadavg(uint8_t *in_avgmaj, uint8_t *in_avgmin);
@@ -218,10 +278,10 @@ uint32_t adler32_checksum(const std::string& in_buf);
 // 802.11 checksum functions, derived from the BBN USRP 802.11 code
 #define IEEE_802_3_CRC32_POLY	0xEDB88320
 unsigned int update_crc32_80211(unsigned int crc, const unsigned char *data,
-								int len, unsigned int poly);
+        int len, unsigned int poly);
 void crc32_init_table_80211(unsigned int *crc32_table);
-unsigned int crc32_le_80211(unsigned int *crc32_table, const unsigned char *buf, 
-							int len);
+unsigned int crc32_le_80211(unsigned int *crc32_table, const unsigned char *buf,
+        int len);
 
 
 // Simple lexer for "advanced" filter stuff and other tools
@@ -234,7 +294,7 @@ unsigned int crc32_le_80211(unsigned int *crc32_table, const unsigned char *buf,
 #define _kis_lex_delim			6
 
 typedef struct {
-	int type;
+    int type;
     std::string data;
 } _kis_lex_rec;
 
@@ -353,27 +413,27 @@ protected:
 
 // Basic override of a stream buf to allow us to operate purely from memory
 struct membuf : public std::streambuf {
-	membuf(const char *begin, const char *end) : begin(begin), end(end) {
-		this->setg(const_cast<char *>(begin), const_cast<char *>(begin), const_cast<char *>(end));
-	}
+    membuf(const char *begin, const char *end) : begin(begin), end(end) {
+        this->setg(const_cast<char *>(begin), const_cast<char *>(begin), const_cast<char *>(end));
+    }
 
-	virtual pos_type seekoff(off_type off, std::ios_base::seekdir dir, 
-			std::ios_base::openmode which = std::ios_base::in) override {
-		if (dir == std::ios_base::cur)
-			gbump(off);
-		else if (dir == std::ios_base::end)
-			setg(const_cast<char *>(begin), const_cast<char *>(end+off), const_cast<char *>(end));
-		else if (dir == std::ios_base::beg)
-			setg(const_cast<char *>(begin), const_cast<char *>(begin+off), const_cast<char *>(end));
+    virtual pos_type seekoff(off_type off, std::ios_base::seekdir dir,
+            std::ios_base::openmode which = std::ios_base::in) override {
+        if (dir == std::ios_base::cur)
+            gbump(off);
+        else if (dir == std::ios_base::end)
+            setg(const_cast<char *>(begin), const_cast<char *>(end+off), const_cast<char *>(end));
+        else if (dir == std::ios_base::beg)
+            setg(const_cast<char *>(begin), const_cast<char *>(begin+off), const_cast<char *>(end));
 
-		return gptr() - eback();
-	}
+        return gptr() - eback();
+    }
 
-	virtual pos_type seekpos(std::streampos pos, std::ios_base::openmode mode) override {
-		return seekoff(pos - pos_type(off_type(0)), std::ios_base::beg, mode);
-	}
+    virtual pos_type seekpos(std::streampos pos, std::ios_base::openmode mode) override {
+        return seekoff(pos - pos_type(off_type(0)), std::ios_base::beg, mode);
+    }
 
-	const char *begin, *end;
+    const char *begin, *end;
 };
 
 // Local copy of strerror_r because glibc did such an amazingly poor job of it
@@ -386,6 +446,7 @@ double ts_now_to_double();
 // both upper and lower case hex, and prepends '0' to the first byte if 
 // an odd number of bytes in the original string
 std::string hex_to_bytes(const std::string& in);
+size_t hex_to_bytes(const std::string_view& in, uint8_t *buf_begin, size_t buf_len);
 
 void thread_set_process_name(const std::string& name);
 
@@ -469,7 +530,7 @@ public:
             return;
 
         blocking = true;
-        
+
         data_available_pm = std::promise<bool>();
 
         auto ft = data_available_pm.get_future();
@@ -488,7 +549,7 @@ public:
             return;
 
         blocking = true;
-        
+
         data_available_pm = std::promise<bool>();
 
         auto ft = data_available_pm.get_future();
@@ -550,25 +611,19 @@ uint64_t human_to_freq_khz(const std::string&);
 template <class S, class D>
 void string_vector_merge(S *source, D *destination,
         std::function<bool (const std::string& a, const std::string& b)> merge_fn) {
-    bool dest_empty = destination->size() == 0;
-
+    // checked against everything merged so far, so duplicates in the source are dropped too
     for (const auto& si : *source) {
-        if (dest_empty) {
+        bool merge = true;
+        for (const auto& sd : *destination) {
+            merge = merge_fn(si, sd);
+
+            if (!merge) {
+                break;
+            }
+        }
+
+        if (merge) {
             destination->push_back(si);
-            continue;
-        } else {
-            bool merge = true;
-            for (const auto& sd : *destination) {
-                merge = merge_fn(si, sd);
-
-                if (!merge) {
-                    break;
-                }
-            }
-
-            if (merge) {
-                destination->push_back(si);
-            }
         }
     }
 }
@@ -576,25 +631,18 @@ void string_vector_merge(S *source, D *destination,
 template <class S, class D>
 void string_vector_merge(const S& source, D *destination,
         std::function<bool (const std::string& a, const std::string& b)> merge_fn) {
-    bool dest_empty = destination->size() == 0;
-
     for (const auto& si : source) {
-        if (dest_empty) {
+        bool merge = true;
+        for (const auto& sd : *destination) {
+            merge = merge_fn(si, sd);
+
+            if (!merge) {
+                break;
+            }
+        }
+
+        if (merge) {
             destination->push_back(si);
-            continue;
-        } else {
-            bool merge = true;
-            for (const auto& sd : *destination) {
-                merge = merge_fn(si, sd);
-
-                if (!merge) {
-                    break;
-                }
-            }
-
-            if (merge) {
-                destination->push_back(si);
-            }
         }
     }
 }
@@ -605,7 +653,8 @@ void string_vector_merge(S& source, D *destination,
     return string_vector_merge<S, D>(&source, destination, merge_fn);
 }
 
-// highly inefficient inline filtering without recreating the object
+// highly inefficient inline filtering without recreating the object; removes every destination
+// element where match_fn(filter entry, element) is true (unlike string_vector_merge)
 template <class D, class S>
 void string_vector_inline_filter(D *destination, S *filter,
         std::function<bool (const std::string& a, const std::string& b)> match_fn) {
@@ -614,11 +663,11 @@ void string_vector_inline_filter(D *destination, S *filter,
     }
 
     for (const auto& fi : *filter) {
-        for (size_t i = 0; i < destination->size(); i++) {
-            if (match_fn(fi, *(destination->begin() + i))) {
+        for (size_t i = 0; i < destination->size(); ) {
+            if (match_fn(fi, *(destination->begin() + i)))
                 destination->erase(destination->begin() + i);
-                break;
-            }
+            else
+                i++;
         }
     }
 }
@@ -632,11 +681,11 @@ void string_vector_inline_filter(D *destination, const S& filter,
     }
 
     for (const auto& fi : filter) {
-        for (size_t i = 0; i < destination->size(); i++) {
-            if (match_fn(fi, *(destination->begin() + i))) {
+        for (size_t i = 0; i < destination->size(); ) {
+            if (match_fn(fi, *(destination->begin() + i)))
                 destination->erase(destination->begin() + i);
-                break;
-            }
+            else
+                i++;
         }
     }
 }
@@ -650,6 +699,11 @@ void string_vector_inline_filter(D& destination, S *filter,
 // an inefficient regex compare that has to compile the regex each time; only call from
 // queries that aren't high load
 bool regex_string_compare(const std::string& restr, const std::string& content);
+
+template <typename E>
+constexpr auto to_underlying(E e) noexcept {
+    return static_cast<std::underlying_type_t<E>>(e);
+}
 
 #endif
 

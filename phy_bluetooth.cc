@@ -31,6 +31,7 @@
 #include "packetchain.h"
 #include "timetracker.h"
 #include "phy_bluetooth.h"
+#include "phy_uav_drone.h"
 #include "kis_httpd_registry.h"
 #include "devicetracker.h"
 #include "alertracker.h"
@@ -83,21 +84,26 @@ kis_bluetooth_phy::kis_bluetooth_phy(int in_phyid) :
     packetchain->register_handler(&packet_bluetooth_hci_json_classifier, this, CHAINPOS_CLASSIFIER, -99);
 
     pack_comp_btdevice = packetchain->register_packet_component("BTDEVICE");
-    pack_comp_l1info = packetchain->register_packet_component("RADIODATA");
     pack_comp_meta = packetchain->register_packet_component("METABLOB");
     pack_comp_json = packetchain->register_packet_component("JSON");
+    pack_comp_remoteid = packetchain->register_packet_component("UAVREMOTEID");
     pack_comp_linkframe = packetchain->register_packet_component("LINKFRAME");
 
     btdev_bredr = devicetracker->get_cached_devicetype("BR/EDR");
     btdev_btle = devicetracker->get_cached_devicetype("BTLE");
     btdev_bt = devicetracker->get_cached_devicetype("BT");
 
-    alert_flipper_ref =
-        alertracker->activate_configured_alert("FLIPPERZERO",
-                "PROBE", kis_alert_severity::high,
-                "Flipper Zero devices can be used to generate spoofed "
-                "BTLE events which can act as denial of service attacks "
-                "or cause other problems with some Bluetooth devices.", phyid);
+    // The Bluetooth and BTLE phys both raise FLIPPERZERO; whichever loads second uses the
+    // alert the first one registered, registering it again would fail and leave this phy
+    // without a valid reference
+    alert_flipper_ref = alertracker->find_activated_alert("FLIPPERZERO");
+    if (alert_flipper_ref < 0)
+        alert_flipper_ref =
+            alertracker->activate_configured_alert("FLIPPERZERO",
+                    "PROBE", kis_alert_severity::high,
+                    "Flipper Zero devices can be used to generate spoofed "
+                    "BTLE events which can act as denial of service attacks "
+                    "or cause other problems with some Bluetooth devices.", phyid);
 
     // Register js module for UI
     auto httpregistry = Globalreg::fetch_mandatory_global_as<kis_httpd_registry>();
@@ -125,7 +131,7 @@ int kis_bluetooth_phy::common_classifier_bluetooth(CHAINCALL_PARMS) {
         return 0;
     }
 
-    in_pack->common_info_ok = true;
+    in_pack->common_info.common_info_ok = true;
     in_pack->common_info.phyid = btphy->fetch_phy_id();
     in_pack->common_info.type = packet_basic_mgmt;
     in_pack->common_info.direction = packet_direction_from;
@@ -170,7 +176,7 @@ int kis_bluetooth_phy::packet_bluetooth_hci_json_classifier(CHAINCALL_PARMS) {
         if (btaddr_mac.state.error)
             throw std::runtime_error("invalid btaddr MAC");
 
-        in_pack->common_info_ok = true;
+        in_pack->common_info.common_info_ok = true;
         in_pack->common_info.phyid = btphy->fetch_phy_id();
         in_pack->common_info.type = packet_basic_mgmt;
         in_pack->common_info.source = btaddr_mac;
@@ -240,6 +246,65 @@ int kis_bluetooth_phy::packet_bluetooth_hci_json_classifier(CHAINCALL_PARMS) {
             btdev->set_connectable(connectable_j.get<unsigned int>());
         }
 
+        // Service UUIDs and Manufacturer Specific Data, parsed by
+        // capture_linux_bluetooth.c's eir_get_uuids_json()/eir_get_manuf().
+        // UUIDs accumulate across reports, like phy_btle.cc's
+        // service_uuid_vec, since one report's EIR budget may not carry
+        // everything advertised.
+        auto uuids_j = json["service_uuids"];
+        if (uuids_j.is_array()) {
+            auto uuid_vec = btdev->get_service_uuid_strs();
+            for (const auto& u : uuids_j) {
+                if (!u.is_string())
+                    continue;
+                auto uuid_str = u.get<std::string>();
+                bool exists = false;
+                for (const auto& existing : *uuid_vec) {
+                    if (existing == uuid_str) {
+                        exists = true;
+                        break;
+                    }
+                }
+                if (!exists)
+                    uuid_vec->push_back(uuid_str);
+            }
+        }
+
+        auto manuf_company_id_j = json["manuf_company_id"];
+        if (manuf_company_id_j.is_string() && manuf_company_id_j.get<std::string>().length() > 0) {
+            btdev->set_manuf_company_id(manuf_company_id_j.get<std::string>());
+            auto manuf_data_j = json["manuf_data"];
+            if (manuf_data_j.is_string())
+                btdev->set_manuf_data(manuf_data_j.get<std::string>());
+        }
+
+        // 16-bit service data, as hex of the UUID and data; Remote ID goes on to
+        // the UAV phy
+        auto service_data_j = json["service_data"];
+        if (service_data_j.is_array()) {
+            for (const auto& sd : service_data_j) {
+                if (!sd.is_string())
+                    continue;
+
+                const auto& sd_hex = sd.get_ref<const std::string&>();
+
+                // UUID, app code, counter, and at least one message
+                if (sd_hex.length() % 2 != 0 || sd_hex.length() / 2 < 4 + odid::message_len)
+                    continue;
+
+                auto raw = hex_to_bytes(sd_hex);
+                auto rid = btphy->packetchain->new_packet_component<uav_remoteid_packinfo>();
+
+                if (odid::decode_ble_service_data((const uint8_t *) raw.data(), raw.length(),
+                            rid->counter, rid->messages)) {
+                    rid->transport = "BLE (HCI)";
+                    rid->device_mac = btaddr_mac;
+                    in_pack->insert(btphy->pack_comp_remoteid, rid);
+                    break;
+                }
+            }
+        }
+
     } catch (const std::exception& e) {
         in_pack->error = true;
         return 0;
@@ -281,7 +346,7 @@ int kis_bluetooth_phy::packet_bluetooth_scan_json_classifier(CHAINCALL_PARMS) {
         if (btaddr_mac.state.error)
             throw std::runtime_error("invalid btaddr MAC");
 
-        in_pack->common_info_ok = true;
+        in_pack->common_info.common_info_ok = true;
         in_pack->common_info.phyid = btphy->fetch_phy_id();
         in_pack->common_info.type = packet_basic_mgmt;
         in_pack->common_info.source = btaddr_mac;
@@ -467,7 +532,7 @@ int kis_bluetooth_phy::packet_tracker_h4_linux(CHAINCALL_PARMS) {
         uint16_t major_group = kis_letoh16(inquiry->service_major_class);
         uint8_t major_class = major_group & 0x1F;
 
-        in_pack->common_info_ok = true;
+        in_pack->common_info.common_info_ok = true;
         in_pack->common_info.phyid = mphy->fetch_phy_id();
         in_pack->common_info.type = packet_basic_mgmt;
         in_pack->common_info.source = mac_addr(inquiry->bdaddr, 6);
@@ -475,11 +540,10 @@ int kis_bluetooth_phy::packet_tracker_h4_linux(CHAINCALL_PARMS) {
         in_pack->common_info.channel = "FHSS";
         in_pack->common_info.freq_khz = 2400000;
 
-        auto l1info = in_pack->fetch_or_add<kis_layer1_packinfo>(mphy->pack_comp_l1info);
-        l1info->signal_type = kis_l1_signal_type_dbm;
-        l1info->freq_khz = 2400000;
-        l1info->channel = "FHSS";
-
+        in_pack->signal_info.data_ok = true;
+        in_pack->signal_info.signal_type = kis_l1_signal_type_dbm;
+        in_pack->signal_info.freq_khz = 2400000;
+        in_pack->signal_info.channel = "FHSS";
     }
 
     return 1;
@@ -494,7 +558,7 @@ int kis_bluetooth_phy::packet_tracker_bluetooth(CHAINCALL_PARMS) {
     if (btpi == nullptr)
         return 0;
 
-    if (!in_pack->common_info_ok) {
+    if (!in_pack->common_info.common_info_ok) {
         return 0;
     }
 

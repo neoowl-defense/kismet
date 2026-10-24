@@ -39,19 +39,27 @@
 
 kis_packet::kis_packet() {
     packet_no = 0;
+    arrival_no = 0;
 	error = 0;
     crc_ok = 0;
     checksum_valid = false;
 	filtered = 0;
     duplicate = 0;
     hash = 0;
+    hash_frame = std::string_view();
 
     assignment_id = 0;
 
     raw_streambuf = nullptr;
     data = std::string_view(nullptr, 0);
 
-    common_info_ok = false;
+    common_info.reset();
+
+    suppress_gps = false;
+    gps_info.reset();
+    reported_gps.reset();
+
+    signal_info.reset();
 }
 
 kis_packet::~kis_packet() {
@@ -63,18 +71,25 @@ kis_packet::~kis_packet() {
 void kis_packet::reset() {
     assignment_id = 0;
     packet_no = 0;
+    arrival_no = 0;
     error = 0;
     crc_ok = false;
     checksum_valid = false;
     filtered = 0;
     duplicate = 0;
 
-    common_info_ok = false;
     common_info.reset();
 
     original.reset();
 
+    suppress_gps = false;
+    gps_info.reset();
+    reported_gps.reset();
+
+    signal_info.reset();
+
     hash = 0;
+    hash_frame = std::string_view();
 
     // reset raw data if in use
     raw_data.clear();

@@ -21,6 +21,8 @@
 
 #include "config.h"
 
+#include <array>
+
 #include "entrytracker.h"
 #include "devicetracker_component.h"
 #include "globalregistry.h"
@@ -28,6 +30,7 @@
 #include "packetchain.h"
 #include "trackedelement.h"
 #include "util.h"
+#include "gps_proto.h"
 
 class kis_gps_location;
 class kis_gps_packinfo;
@@ -102,6 +105,62 @@ protected:
     std::shared_ptr<tracker_element_uint8> singleton;
 };
 
+// One satellite in view, as the GPS reports it
+class kis_gps_satellite : public tracker_component {
+public:
+    kis_gps_satellite() :
+        tracker_component() {
+        register_fields();
+        reserve_fields(NULL);
+    }
+
+    kis_gps_satellite(int in_id) :
+        tracker_component(in_id) {
+        register_fields();
+        reserve_fields(NULL);
+    }
+
+    virtual uint32_t get_signature() const override {
+        return adler32_checksum("kis_gps_satellite");
+    }
+
+    virtual std::shared_ptr<tracker_element> clone_type() noexcept override {
+        using this_t = typename std::remove_pointer<decltype(this)>::type;
+        auto r = std::make_shared<this_t>();
+        r->set_id(this->get_id());
+        return r;
+    }
+
+    void set(const gps_satellite& s) {
+        constellation->set(gps_constellation_name(s.constellation));
+        id->set(s.id);
+        elevation->set(s.elevation);
+        azimuth->set(s.azimuth);
+        cn0->set(s.cn0);
+        used->set(s.used);
+    }
+
+protected:
+    virtual void register_fields() override {
+        tracker_component::register_fields();
+
+        register_field("kismet.gps.satellite.constellation", "Constellation (GPS, GLONASS, Galileo, ...)",
+                &constellation);
+        register_field("kismet.gps.satellite.id", "Satellite number, as the GPS reports it", &id);
+        register_field("kismet.gps.satellite.elevation", "Elevation in degrees, -1 if not known", &elevation);
+        register_field("kismet.gps.satellite.azimuth", "Azimuth in degrees, -1 if not known", &azimuth);
+        register_field("kismet.gps.satellite.cn0", "Signal (C/N0) in dB-Hz, 0 if not tracked", &cn0);
+        register_field("kismet.gps.satellite.used", "Used in the fix: 1 yes, 0 no, -1 not known", &used);
+    }
+
+    std::shared_ptr<tracker_element_string> constellation;
+    std::shared_ptr<tracker_element_uint16> id;
+    std::shared_ptr<tracker_element_int16> elevation;
+    std::shared_ptr<tracker_element_int16> azimuth;
+    std::shared_ptr<tracker_element_double> cn0;
+    std::shared_ptr<tracker_element_int8> used;
+};
+
 // GPS superclass; built by a GPS builder; GPS drivers implement the low-level GPS 
 // interaction (such as serial port, network, etc)
 class kis_gps : public tracker_component {
@@ -134,6 +193,15 @@ public:
 
     __ProxyPrivSplitVM(device_connected, uint8_t, bool, bool, gps_connected, data_mutex);
 
+    virtual void pre_serialize() override {
+        kis_lock_guard<kis_mutex> lk(data_mutex, kismet::retain_lock, "gps preserialize");
+        publish_quality(time(0));
+    }
+
+    virtual void post_serialize() override {
+        kis_lock_guard<kis_mutex> lk(data_mutex, std::adopt_lock);
+    }
+
     virtual std::shared_ptr<kis_gps_packinfo> get_location() { 
         kis_lock_guard<kis_mutex> lk(data_mutex);
         return gps_location;
@@ -149,6 +217,12 @@ public:
     virtual bool get_location_valid() { return false; }
 
     virtual bool open_gps(std::string in_definition);
+
+    // Stop the device when the GPS is removed; it won't reconnect
+    virtual void close_gps() { }
+
+    // Copy the current signal quality fields into a location report
+    void add_signal_report(tracker_component& report);
 
     // Various GPS transformation utility functions
     static double gps_calc_heading(double in_lat, double in_lon, double in_lat2, double in_lon2);
@@ -192,10 +266,131 @@ protected:
                 "Unix timestamp of last data from GPS", &gps_data_time);
         register_field("kismet.gps.signal_time",
                 "Unix timestamp of last signal from GPS", &gps_signal_time);
+
+        // Signal quality; only present while known
+        sats_used_id = register_dynamic_field<tracker_element_uint8>("kismet.gps.satellites_used",
+                "Satellites used in the fix");
+        sats_visible_id = register_dynamic_field<tracker_element_uint8>("kismet.gps.satellites_visible",
+                "Satellites in view");
+        hdop_id = register_dynamic_field<tracker_element_double>("kismet.gps.hdop",
+                "Horizontal dilution of precision, as reported by the GPS");
+        vdop_id = register_dynamic_field<tracker_element_double>("kismet.gps.vdop",
+                "Vertical dilution of precision, as reported by the GPS");
+        precision_h_id = register_dynamic_field<tracker_element_double>("kismet.gps.precision_h",
+                "Estimated horizontal position error, in meters");
+        precision_v_id = register_dynamic_field<tracker_element_double>("kismet.gps.precision_v",
+                "Estimated vertical position error, in meters");
+        precision_source_id = register_dynamic_field<tracker_element_string>("kismet.gps.precision_source",
+                "Position error source: 'reported' by the GPS (each GPS uses its own confidence "
+                "level), 'estimated' from the dilution of precision, or 'mixed'");
+        signal_cn0_id = register_dynamic_field<tracker_element_double>("kismet.gps.signal_cn0",
+                "Average signal strength (C/N0) of the strongest satellites, in dB-Hz");
+        signal_quality_id = register_dynamic_field<tracker_element_uint8>("kismet.gps.signal_quality",
+                "Estimated GPS signal quality, 0 (no fix) to 100");
+        satellites_id = register_dynamic_field<tracker_element_vector>("kismet.gps.satellites",
+                "Satellites in view, when the GPS lists them");
+        satellite_entry_id =
+            Globalreg::globalreg->entrytracker->register_field("kismet.gps.satellite",
+                    tracker_element_factory<kis_gps_satellite>(), "Satellite in view");
     }
 
     // Push the locations into the tracked locations and swap
     virtual void update_locations();
+
+    // Merge a decoded protocol report into the current location
+    void apply_fix(const gps_fix_update& update);
+
+    // Merge signal quality which arrived without a location
+    void apply_quality(const gps_quality_update& update);
+
+    // Forget the signal quality, such as when the device disconnects
+    void clear_quality();
+
+public:
+    // The satellites and the signal summary, for the periodic satellite log; nullptr when
+    // the GPS lists no satellites
+    std::shared_ptr<tracker_element_map> satellite_snapshot();
+
+    // The GPS record without its satellite list, for the per-second track log
+    std::shared_ptr<tracker_element_map> track_snapshot();
+
+protected:
+
+    // Quality values are dropped when no report has refreshed them for this long; slow
+    // reports such as UBX NAV-SAT at low baud rates arrive every 10 seconds
+    static constexpr time_t quality_expire = 12;
+
+    // Pseudorange error used to estimate the position error from the DOP, meters
+    static constexpr double estimated_uere = 4.0;
+
+    enum class quality_field : uint8_t {
+        sats_used,
+        sats_visible,
+        hdop,
+        vdop,
+        error_h,
+        error_v,
+        cn0,
+        count,
+    };
+
+    struct quality_value {
+        bool present = false;
+        double value = 0;
+        time_t time = 0;
+        gps_quality_update::source_rank rank = gps_quality_update::source_rank::nmea;
+    };
+
+    // Under data_mutex
+    std::array<quality_value, static_cast<size_t>(quality_field::count)> quality_state;
+
+    // The satellite list, merged and expired like the other quality values; under data_mutex
+    std::vector<gps_satellite> satellites_state;
+    quality_value satellites_meta;
+
+    quality_value& quality_at(quality_field f) {
+        return quality_state[static_cast<size_t>(f)];
+    }
+
+    void merge_quality(const gps_quality_update& update, time_t now);
+    void expire_quality(time_t now);
+    // Position error for a fix from the current quality values; 0 when unknown
+    double quality_precision(bool vertical, bool& reported);
+    // Update the tracked quality fields from the current values and location
+    void publish_quality(time_t now);
+
+    template<typename T, typename V>
+    void set_quality_field(uint16_t id, const V& v) {
+        auto ci = find(id);
+
+        if (ci == end()) {
+            auto e = Globalreg::globalreg->entrytracker->get_shared_instance_as<T>(id);
+            e->set(v);
+            insert(e);
+            return;
+        }
+
+        std::static_pointer_cast<T>(ci->second)->set(v);
+    }
+
+    void clear_quality_field(uint16_t id) {
+        auto ci = find(id);
+
+        if (ci != end())
+            erase(ci);
+    }
+
+    uint16_t sats_used_id, sats_visible_id, hdop_id, vdop_id, precision_h_id, precision_v_id,
+             precision_source_id, signal_cn0_id, signal_quality_id, satellites_id;
+    int satellite_entry_id;
+
+    // Last time heading was set or calculated; calculating it more often than every few
+    // seconds is mostly noise
+    time_t fix_heading_time = 0;
+
+    // Last time the receiver reported its fix mode (NMEA GSA or a binary navigation report)
+    static constexpr time_t fix_reported_stale = 3;
+    time_t fix_reported_time = 0;
 
     std::shared_ptr<packet_chain> packetchain;
     std::shared_ptr<gps_tracker> gpstracker;

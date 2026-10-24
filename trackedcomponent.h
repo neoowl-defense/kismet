@@ -156,6 +156,7 @@ class tracker_component : public tracker_element_map {
                 insert(cvar); \
                 return cvar; \
             } \
+            return nullptr; \
         } \
         return std::static_pointer_cast<ctype>(ci->second); \
     } \
@@ -167,6 +168,7 @@ class tracker_component : public tracker_element_map {
                 insert(cvar); \
                 return get_tracker_value<ptype>(cvar); \
             } \
+            return (rtype){}; \
         } \
         return (rtype) get_tracker_value<ptype>(ci->second); \
     } \
@@ -186,6 +188,7 @@ class tracker_component : public tracker_element_map {
                 cvar->set(in); \
                 return; \
             } \
+            return; \
         } \
         std::static_pointer_cast<ctype>(ci->second)->set(in); \
     } \
@@ -290,7 +293,7 @@ class tracker_component : public tracker_element_map {
     }
 
 // Proxy, connected to a dynamic element.  Getting or setting the dynamic element
-// creates it.  The lamda function is called after setting.
+// creates it.  The lambda function is called after setting.
 #define __ProxyDynamicL(name, ptype, itype, rtype, cvar, id, lambda) \
     inline shared_tracker_element get_tracker_##name() { \
         if (cvar == nullptr) { \
@@ -642,6 +645,7 @@ class tracker_component : public tracker_element_map {
                 this->insert(cvar); \
                 return cvar; \
             } \
+            return nullptr; \
         } \
         return std::static_pointer_cast<ctype>(ci->second); \
     } \
@@ -662,6 +666,7 @@ class tracker_component : public tracker_element_map {
                 this->insert(cvar); \
                 return cvar; \
             } \
+            return nullptr; \
         } \
         return std::static_pointer_cast<ctype>(ci->second); \
     } \
@@ -810,7 +815,9 @@ class tracker_component : public tracker_element_map {
         } \
         inline void set_tracker_##name(const std::shared_ptr<ttype>& in) { \
             if (cvar != nullptr) { \
-                in->set_id(cvar->get_id()); \
+                /* in may be shared between objects; only write the id if it differs */ \
+                if (in->get_id() != cvar->get_id()) \
+                    in->set_id(cvar->get_id()); \
                 erase(cvar); \
             } \
             insert(in); \

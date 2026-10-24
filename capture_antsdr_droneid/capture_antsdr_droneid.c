@@ -126,6 +126,7 @@ int probe_callback(kis_capture_handler_t *caph, uint32_t seqno,
     interface = strndup(placeholder, placeholder_len);
 
     if (strstr(interface, "antsdr-droneid") != interface) {
+        snprintf(msg, STATUS_MAX, "Expected antsdr-droneid interface, skipping");
         free(interface);
         return 0;
     }

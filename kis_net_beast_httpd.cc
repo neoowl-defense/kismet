@@ -18,11 +18,15 @@
 
 #include "kis_net_beast_httpd.h"
 
+#include <algorithm>
+#include <cstring>
 #include <iostream>
 #include <fstream>
 #include <random>
+#include <sstream>
 
 #include <stdio.h>
+#include <sys/stat.h>
 
 #include "globalregistry.h"
 
@@ -88,6 +92,10 @@ kis_net_beast_httpd::kis_net_beast_httpd(boost::asio::ip::tcp::endpoint& endpoin
 
     route_mutex.set_name("kis_net_beast_httpd route vector");
     auth_mutex.set_name("kis_net_beast_httpd auth");
+
+    // Reported by fetch_port() and fetch_using_ssl(), for the server announcement and the console
+    port = endpoint.port();
+    use_ssl = false;
 }
 
 void kis_net_beast_httpd::trigger_deferred_startup() {
@@ -185,7 +193,7 @@ void kis_net_beast_httpd::trigger_deferred_startup() {
         _MSG("This is the first time Kismet has been run as this user.  You will need to set an "
                 "administrator username and password before you can use any features of Kismet.  Visit "
                 "http://localhost:2501/ to configure the initial login, or consult the Kismet "
-                "documentation at https://www.kismetwireless.net/docs/readme/webserver/ about how to "
+                "documentation at https://www.kismetwireless.net/docs/readme/configuring/webserver/ about how to "
                 "set a password manually.", MSGFLAG_INFO | MSGFLAG_LOCAL);
     }
 
@@ -489,15 +497,15 @@ void kis_net_beast_httpd::handle_connection(const boost::system::error_code& ec,
     if (!running)
         return;
 
-	// Spin each connection into its own thread
+    // Spin each connection into its own thread
     if (!ec) {
         std::thread conthread([this, tcp_socket = boost::beast::tcp_stream(std::move(socket))]() mutable {
                 thread_set_process_name("BEAST");
 
                 while (tcp_socket.socket().is_open()) {
-					// Reset the timeout every loop through; each request in this
-					// socket pipeline has up to 30 seconds to complete
-					boost::beast::get_lowest_layer(tcp_socket).expires_after(std::chrono::seconds(30));
+                    // Reset the timeout every loop through; each request in this
+                    // socket pipeline has up to 30 seconds to complete
+                    boost::beast::get_lowest_layer(tcp_socket).expires_after(std::chrono::seconds(30));
 
                     // Associate the socket
                     auto conn =
@@ -786,7 +794,7 @@ void kis_net_beast_httpd::register_websocket_route(const std::string& route,
 std::string kis_net_beast_httpd::create_auth(const std::string& name, const std::string& role, time_t expiry) {
     kis_lock_guard<kis_mutex> lk(auth_mutex, "beast_httpd create_auth");
 
-	return create_auth_impl(name, role, expiry);
+    return create_auth_impl(name, role, expiry);
 }
 
 std::string kis_net_beast_httpd::create_auth_impl(const std::string& name, const std::string& role, time_t expiry) {
@@ -881,13 +889,18 @@ std::shared_ptr<kis_net_beast_auth> kis_net_beast_httpd::check_auth_token(const 
     // Step one: is it a JWT token?
     auto authtoken = check_jwt_token(token);
 
-    if (authtoken != nullptr)
+    if (authtoken != nullptr) {
+        if (!authtoken->is_valid())
+            return nullptr;
         return authtoken;
+    }
 
     for (const auto& a : auth_vec) {
-        if (a->check_auth(token))
+        if (a->check_auth(token)) {
+            if (!a->is_valid())
+                return nullptr;
             return a;
-
+        }
     }
 
     return nullptr;
@@ -1071,11 +1084,24 @@ bool kis_net_beast_httpd::serve_file(std::shared_ptr<kis_net_beast_httpd_connect
             continue;
         }
 
-        if (strstr(modified_realpath, base_realpath) != modified_realpath) {
+        // A matching path prefix alone can also match a sibling directory.
+        const size_t base_len = std::strlen(base_realpath);
+        if (std::strncmp(modified_realpath, base_realpath, base_len) != 0 ||
+                (base_realpath[base_len - 1] != '/' &&
+                 modified_realpath[base_len] != '/' &&
+                 modified_realpath[base_len] != '\0')) {
             if (modified_realpath)
                 free(modified_realpath);
             if (base_realpath)
                 free(base_realpath);
+            continue;
+        }
+
+        // Only regular files; a directory opens, but reading it fails and the request hangs
+        struct stat st;
+        if (stat(modified_realpath, &st) != 0 || !S_ISREG(st.st_mode)) {
+            free(modified_realpath);
+            free(base_realpath);
             continue;
         }
 
@@ -1809,7 +1835,7 @@ kis_net_beast_auth::kis_net_beast_auth(const std::string& token, const std::stri
     role_{role},
     time_created_{time(0)},
     time_accessed_{0},
-    time_expires_{0} { }
+    time_expires_{expires} { }
 
 kis_net_beast_auth::kis_net_beast_auth(const jwt::decoded_jwt<jwt::traits::kazuho_picojson>& jwt) {
     try {
@@ -1917,6 +1943,136 @@ void kis_net_web_function_endpoint::handle_request(std::shared_ptr<kis_net_beast
 
 }
 
+namespace {
+    // Reformat compact JSON from the v2 serializer without re-parsing it, so string contents
+    // (which may not be valid UTF-8) pass through unchanged
+    void json_v2_pretty(const std::string& in, std::ostream& os) {
+        int depth = 0;
+        bool in_str = false;
+        bool esc = false;
+
+        auto newline = [&os](int d) {
+            os << '\n';
+            for (int i = 0; i < d; i++)
+                os << "    ";
+        };
+
+        for (size_t i = 0; i < in.size(); i++) {
+            const char c = in[i];
+
+            if (in_str) {
+                os << c;
+
+                if (esc)
+                    esc = false;
+                else if (c == '\\')
+                    esc = true;
+                else if (c == '"')
+                    in_str = false;
+
+                continue;
+            }
+
+            switch (c) {
+                case '"':
+                    in_str = true;
+                    os << c;
+                    break;
+                case '{':
+                case '[':
+                    os << c;
+                    if (i + 1 < in.size() && (in[i + 1] == '}' || in[i + 1] == ']')) {
+                        os << in[++i];
+                        break;
+                    }
+                    newline(++depth);
+                    break;
+                case '}':
+                case ']':
+                    depth = std::max(depth - 1, 0);
+                    newline(depth);
+                    os << c;
+                    break;
+                case ',':
+                    os << c;
+                    newline(depth);
+                    break;
+                case ':':
+                    os << ": ";
+                    break;
+                case ' ':
+                case '\t':
+                case '\r':
+                case '\n':
+                    break;
+                default:
+                    os << c;
+            }
+        }
+
+        os << '\n';
+    }
+
+    // Write each member of a top level array as its own line, or the whole object as one line
+    void json_v2_lines(const std::string& in, std::ostream& os) {
+        const auto b = in.find_first_not_of(" \t\r\n");
+
+        if (b == std::string::npos)
+            return;
+
+        if (in[b] != '[') {
+            os << in << '\n';
+            return;
+        }
+
+        auto emit = [&in, &os](size_t start, size_t end) {
+            const auto s = in.find_first_not_of(" \t\r\n", start);
+            const auto e = in.find_last_not_of(" \t\r\n", end - 1);
+
+            if (s == std::string::npos || e == std::string::npos || s >= end || e < s)
+                return;
+
+            os.write(in.data() + s, e - s + 1);
+            os << '\n';
+        };
+
+        int depth = 0;
+        bool in_str = false;
+        bool esc = false;
+        size_t start = b + 1;
+
+        for (size_t i = b + 1; i < in.size(); i++) {
+            const char c = in[i];
+
+            if (in_str) {
+                if (esc)
+                    esc = false;
+                else if (c == '\\')
+                    esc = true;
+                else if (c == '"')
+                    in_str = false;
+
+                continue;
+            }
+
+            if (c == '"') {
+                in_str = true;
+            } else if (c == '{' || c == '[') {
+                depth++;
+            } else if (c == '}' || c == ']') {
+                if (depth == 0) {
+                    emit(start, i);
+                    return;
+                }
+                depth--;
+            } else if (c == ',' && depth == 0) {
+                emit(start, i);
+                start = i + 1;
+            }
+        }
+    }
+}
+
 void kis_net_web_jsonable_endpoint::handle_request(std::shared_ptr<kis_net_beast_httpd_connection> con) {
     kis_unique_lock<kis_mutex> lk(mutex, std::defer_lock, __func__);
 
@@ -1926,28 +2082,50 @@ void kis_net_web_jsonable_endpoint::handle_request(std::shared_ptr<kis_net_beast
     std::ostream os(&con->response_stream());
 
     try {
-		/*
-        auto output_content = std::shared_ptr<tracker_element>();
-        auto rename_map = Globalreg::new_from_pool<tracker_element_serializer::rename_map>();
-		*/
-
         if (content == nullptr) {
             con->set_status(500);
             os << "Invalid request:  No backing content or generator\n";
             return;
         }
 
+        const auto ft_k = con->uri_params().find("FILETYPE");
+        const auto ext = ft_k != con->uri_params().end() ? str_lower(ft_k->second) : std::string{"json"};
+
+        const bool compact = ext == "json" || ext == "cmd" || ext == "jcmd";
+
+        if (!compact && ext != "prettyjson" && ext != "ekjson" && ext != "itjson") {
+            con->set_status(400);
+            os << "Invalid request:  Unsupported output format\n";
+            return;
+        }
+
         if (pre_func)
             pre_func(content);
 
-		/*
-        auto summary = con->summarize_with_json(output_content, rename_map);
+        json_adapter_v2::raw_field_list fields;
+        con->extract_field_summary_v2(fields);
 
-        Globalreg::globalreg->entrytracker->serialize(static_cast<std::string>(con->uri()), os,
-                summary, rename_map);
-		*/
+        if (compact) {
+            json_adapter_v2::serialize(os, content, ext, fields);
+        } else {
+            std::stringstream ss;
 
-		json_adapter_v2::serialize(os, content);
+            if (ext == "ekjson") {
+                // ELK style, no dots in field names
+                json_adapter_v2::serialize(ss, content, ext, fields,
+                        [](const std::string& n) {
+                            return fmt::format("\"{}\"",
+                                    json_adapter_v2::sanitize_string(multi_replace_all(n, ".", "_")));
+                        });
+            } else {
+                json_adapter_v2::serialize(ss, content, ext, fields);
+            }
+
+            if (ext == "prettyjson")
+                json_v2_pretty(ss.str(), os);
+            else
+                json_v2_lines(ss.str(), os);
+        }
 
         os.flush();
 
