@@ -12,6 +12,7 @@ PORT=${BSSID_TEST_PORT:-2599}
 WORK=$(mktemp -d)
 if [ -n "$KEEP" ]; then echo "work dir: $WORK"; else trap 'rm -rf "$WORK"' EXIT; fi
 
+LOGIN=bssidtest:bssidtest   # the test Kismet's web login, local only
 printf "httpd_bind_address=127.0.0.1\nhttpd_port=%s\nremote_capture_enabled=false\nenable_logging=false\nhttpd_username=bssidtest\nhttpd_password=bssidtest\nhelper_binary_path=%s\n" \
     "$PORT" "$K" > "$WORK/override.conf"
 mkdir -p "$WORK/home"
@@ -28,7 +29,7 @@ if [ $up = 0 ]; then
     echo "FAIL: Kismet did not start:"; tail -5 "$WORK/kismet.log"; fail=1
 else
     # The stream stays open until the connection closes; the start of it is enough
-    code=$(curl -s -m 2 -o "$WORK/stream" -w "%{http_code}" -u bssidtest:bssidtest \
+    code=$(curl -s -m 2 -o "$WORK/stream" -w "%{http_code}" -u "$LOGIN" \
         "http://127.0.0.1:$PORT/phy/phy80211/pcap/by-bssid/00:11:22:33:44:55/packets.pcapng")
     # A pcapng file begins with a section header block, type 0x0A0D0D0A
     magic=$(od -An -tx1 -N4 "$WORK/stream" 2>/dev/null | tr -d ' \n')

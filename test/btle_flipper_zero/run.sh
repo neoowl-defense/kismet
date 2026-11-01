@@ -29,6 +29,7 @@ expect() {
 }
 ORDER="stm32_public stm32_random oui_public oui_random uuid_later name_later company other burst"
 
+LOGIN=fliptest:fliptest   # the test Kismet's web login, local only
 printf "httpd_bind_address=127.0.0.1\nhttpd_port=%s\nremote_capture_enabled=false\nenable_logging=false\nhttpd_username=fliptest\nhttpd_password=fliptest\nhelper_binary_path=%s\n" \
     "$PORT" "$K" > "$WORK/override.conf"
 
@@ -57,7 +58,7 @@ for sc in ${@:-$ORDER}; do
     # Devices that raised FLIPPERZERO; scenarios expecting none wait the whole time
     for i in $(seq 1 $settle); do
         sleep 1
-        got=$(curl -s -u fliptest:fliptest http://127.0.0.1:$PORT/alerts/all_alerts.json | python3 -c '
+        got=$(curl -s -u "$LOGIN" http://127.0.0.1:$PORT/alerts/all_alerts.json | python3 -c '
 import sys, json
 macs = {a["kismet.alert.source_mac"] for a in json.load(sys.stdin)
         if a["kismet.alert.header"] == "FLIPPERZERO"}

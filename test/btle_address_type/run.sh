@@ -12,6 +12,7 @@ PORT=${ADDRESS_TEST_PORT:-2598}
 WORK=$(mktemp -d)
 if [ -n "$KEEP" ]; then echo "work dir: $WORK"; else trap 'rm -rf "$WORK"' EXIT; fi
 
+LOGIN=addrtest:addrtest   # the test Kismet's web login, local only
 printf "httpd_bind_address=127.0.0.1\nhttpd_port=%s\nremote_capture_enabled=false\nenable_logging=false\nhttpd_username=addrtest\nhttpd_password=addrtest\nhelper_binary_path=%s\n" \
     "$PORT" "$K" > "$WORK/override.conf"
 mkdir -p "$WORK/home"
@@ -27,7 +28,7 @@ want="00:1B:DC:12:34:56=1 C6:11:22:33:44:55=2"
 got=
 for i in $(seq 1 30); do
     sleep 1
-    got=$(curl -s -u addrtest:addrtest -d 'json={"fields":["kismet.device.base.macaddr","btle.device/btle.device.address_type"]}' \
+    got=$(curl -s -u "$LOGIN" -d 'json={"fields":["kismet.device.base.macaddr","btle.device/btle.device.address_type"]}' \
         http://127.0.0.1:$PORT/devices/views/phy-BTLE/devices.json 2>/dev/null | python3 -c '
 import sys, json
 try:

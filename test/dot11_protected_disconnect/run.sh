@@ -24,6 +24,7 @@ expect() {
 }
 ORDER="router pmf_protected pmf_protected_disassoc badreason"
 
+LOGIN=disconnecttest:disconnecttest   # the test Kismet's web login, local only
 printf "httpd_bind_address=127.0.0.1\nhttpd_port=%s\nremote_capture_enabled=false\nenable_logging=false\nhttpd_username=disconnecttest\nhttpd_password=disconnecttest\nhelper_binary_path=%s\n" \
     "$PORT" "$K" > "$WORK/override.conf"
 # DEAUTHCODEINVALID and DISCONCODEINVALID are off by default; turn them on to check protected
@@ -50,7 +51,7 @@ for sc in ${@:-$ORDER}; do
     fi
     sleep 5
 
-    got=$(curl -s -u disconnecttest:disconnecttest http://127.0.0.1:$PORT/alerts/all_alerts.json | python3 -c '
+    got=$(curl -s -u "$LOGIN" http://127.0.0.1:$PORT/alerts/all_alerts.json | python3 -c '
 import sys, json
 names = {a["kismet.alert.header"] for a in json.load(sys.stdin)}
 print(" ".join(sorted(n for n in names if n in ("DEAUTHCODEINVALID", "DISCONCODEINVALID"))))')

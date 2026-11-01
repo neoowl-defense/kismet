@@ -1,0 +1,6 @@
+# Throwaway web logins of the test Kismet each test script starts on 127.0.0.1;
+# 2b97c711d had them inline on the curl line, the next commit moves them into LOGIN.
+2b97c711db178cd1461e7eec00299d2588836356:test/btle_address_type/run.sh:curl-auth-user:30
+2b97c711db178cd1461e7eec00299d2588836356:test/btle_flipper_zero/run.sh:curl-auth-user:60
+2b97c711db178cd1461e7eec00299d2588836356:test/dot11_pcap_by_bssid/run.sh:curl-auth-user:31
+2b97c711db178cd1461e7eec00299d2588836356:test/dot11_protected_disconnect/run.sh:curl-auth-user:53
