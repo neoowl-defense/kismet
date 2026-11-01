@@ -379,6 +379,8 @@ int kis_btle_phy::common_classifier(CHAINCALL_PARMS) {
 
     // Store the PDU type from the packet
     btle_dev->set_pdu_type(btle_info->btle_decode->pdu_type());
+    btle_dev->set_pdu_types_seen(btle_dev->get_pdu_types_seen() |
+            (uint16_t) (1u << btle_info->btle_decode->pdu_type()));
     btle_dev->set_address_type(static_cast<uint8_t>(btle_info->btle_decode->is_txaddr_random() ?
                 btle_address_type::random_address : btle_address_type::public_address));
 

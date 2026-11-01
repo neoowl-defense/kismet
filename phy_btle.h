@@ -134,6 +134,11 @@ public:
    __Proxy(simultaneous_br_edr_host, uint8_t, bool, bool, simultaneous_br_edr_host);
    __Proxy(pdu_type, uint8_t, uint8_t, uint8_t, pdu_type);
 
+   // Every PDU type the address has sent, bit n for type n.  An address that only sent
+   // SCAN_REQ or CONNECT_IND is a scanner or initiator (often a phone, from a throwaway
+   // random address) rather than an advertising device; pdu_type shows only the latest.
+   __Proxy(pdu_types_seen, uint16_t, uint16_t, uint16_t, pdu_types_seen);
+
    // A btle_address_type, from the TxAdd bit of the device's latest packet
    __Proxy(address_type, uint8_t, uint8_t, uint8_t, address_type);
 
@@ -170,6 +175,9 @@ protected:
                 &simultaneous_br_edr_host);
         register_field("btle.device.pdu_type", "BTLE advertising PDU type",
                 &pdu_type);
+        register_field("btle.device.pdu_types_seen", "every BTLE PDU type the address sent, "
+                "bit n for type n (3 SCAN_REQ, 5 CONNECT_IND: a scanner or initiator)",
+                &pdu_types_seen);
         register_field("btle.device.address_type", "address type: 0 unknown, 1 public, "
                 "2 random", &address_type);
         register_field("btle.device.service_uuid_vec", "advertised service UUIDs", &service_uuid_vec);
@@ -186,6 +194,7 @@ protected:
     std::shared_ptr<tracker_element_uint8> simultaneous_br_edr_controller;
     std::shared_ptr<tracker_element_uint8> simultaneous_br_edr_host;
     std::shared_ptr<tracker_element_uint8> pdu_type;
+    std::shared_ptr<tracker_element_uint16> pdu_types_seen;
     std::shared_ptr<tracker_element_uint8> address_type;
     std::shared_ptr<tracker_element_vector_string> service_uuid_vec;
     std::shared_ptr<tracker_element_string> manuf_company_id;
