@@ -65,6 +65,16 @@ kismet_ui.AddDeviceDetail("btle", "BTLE", 0, {
                 help: "Device supports BT classic BR/EDR modes as a host",
             },
             {
+                field: "btle.device/btle.device.address_type",
+                title: "Address Type",
+                filterOnZero: true,
+                draw: function(opts) {
+                    var types = { 1: "Public", 2: "Random" };
+                    return types[opts['value']] || "Unknown (" + opts['value'] + ")";
+                },
+                help: "A public address is fixed and assigned to the device's maker; a random address may be static, or a private address that changes over time",
+            },
+            {
                 field: "btle.device/btle.device.pdu_type",
                 title: "PDU Type",
                 draw: function(opts) {
@@ -81,6 +91,22 @@ kismet_ui.AddDeviceDetail("btle", "BTLE", 0, {
                     return pdu_types[opts['value']] || "Unknown (" + opts['value'] + ")";
                 },
                 help: "BLE advertising PDU type indicating if device is connectable",
+            },
+            {
+                field: "btle.device/btle.device.flipper_zero",
+                title: "Flipper Zero",
+                filterOnZero: true,
+                draw: function(opts) {
+                    var signatures = {
+                        1: "Service UUID 0x308x",
+                        2: "80:E1:26/27 address",
+                        3: "Flipper Devices OUI 0C:FA:22",
+                        4: "Flipper Devices company ID 0x0E29",
+                        5: "'Flipper ' name"
+                    };
+                    return "Matches (" + (signatures[opts['value']] || opts['value']) + ")";
+                },
+                help: "The device matches a Flipper Zero signature, which raises the FLIPPERZERO alert",
             },
             ],
         });

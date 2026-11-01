@@ -37,6 +37,7 @@
 #include "alertracker.h"
 
 #include "bluetooth_types.h"
+#include "flipper_zero.h"
 
 
 #define h4_direction_sent                       0x00
@@ -203,6 +204,8 @@ int kis_bluetooth_phy::packet_bluetooth_hci_json_classifier(CHAINCALL_PARMS) {
         if (devname_j.is_string())
             basedev->set_devicename(munge_to_printable(devname_j));
 
+        auto new_btdev = btdev == nullptr;
+
         if (btdev == nullptr) {
             std::stringstream ss;
             ss << "Detected new Bluetooth device " << btaddr_mac;
@@ -238,6 +241,14 @@ int kis_bluetooth_phy::packet_bluetooth_hci_json_classifier(CHAINCALL_PARMS) {
                     btdev->set_bt_device_type(static_cast<uint8_t>(bt_device_type::bt));
                     break;
             }
+        }
+
+        // type is the address type from the kernel's management API: BDADDR_BREDR (0),
+        // BDADDR_LE_PUBLIC (1) or BDADDR_LE_RANDOM (2)
+        if (devtype_j.is_number()) {
+            const auto t = devtype_j.get<unsigned int>();
+            btdev->set_address_type(static_cast<uint8_t>(t == 2 ? bt_address_type::random_address :
+                        t < 2 ? bt_address_type::public_address : bt_address_type::unknown));
         }
 
         // Read connectable flag from HCI capture source
@@ -277,6 +288,25 @@ int kis_bluetooth_phy::packet_bluetooth_hci_json_classifier(CHAINCALL_PARMS) {
             if (manuf_data_j.is_string())
                 btdev->set_manuf_data(manuf_data_j.get<std::string>());
         }
+
+        // The Flipper Zero is LE only; type is the address type from the kernel's management
+        // API, BDADDR_LE_PUBLIC (1) or BDADDR_LE_RANDOM (2) for LE
+        const auto addr_type = devtype_j.is_number() ? devtype_j.get<unsigned int>() : 0;
+        // The capture helper sends every key in every report, empty when the advert didn't
+        // carry it, so only non-empty values are new input
+        const auto filled = [](const nlohmann::json& j) {
+            return (j.is_string() && !j.get_ref<const std::string&>().empty()) ||
+                (j.is_array() && !j.empty());
+        };
+        const auto flipper_input = new_btdev || filled(devname_j) || filled(uuids_j) ||
+            filled(manuf_company_id_j);
+        if ((addr_type == 1 || addr_type == 2) && flipper_input && !btdev->get_flipper_zero())
+            flipper_zero::flag(*btdev, flipper_zero::match(btaddr_mac, addr_type == 1,
+                        basedev->get_devicename(), btdev->get_manuf_company_id(),
+                        *btdev->get_service_uuid_strs()));
+
+        flipper_zero::raise_pending(*btdev, btphy->alertracker, btphy->alert_flipper_ref,
+                in_pack, basedev->get_macaddr());
 
         // 16-bit service data, as hex of the UUID and data; Remote ID goes on to
         // the UAV phy
@@ -337,8 +367,6 @@ int kis_bluetooth_phy::packet_bluetooth_scan_json_classifier(CHAINCALL_PARMS) {
 
         auto btaddr_j = json["btaddr"];
 
-        auto new_device = false;
-
         if (btaddr_j.is_null()) 
             throw std::runtime_error("no btaddr in scan report");
 
@@ -391,6 +419,8 @@ int kis_bluetooth_phy::packet_bluetooth_scan_json_classifier(CHAINCALL_PARMS) {
         auto btdev_bluetooth =
             btdev->get_sub_as<bluetooth_tracked_device>(btphy->bluetooth_device_entry_id);
 
+        auto new_btdev = btdev_bluetooth == nullptr;
+
         if (btdev_bluetooth == nullptr) {
             newdevstr << "Detected new HCI Bluetooth device " << btaddr_mac; 
 
@@ -406,8 +436,6 @@ int kis_bluetooth_phy::packet_bluetooth_scan_json_classifier(CHAINCALL_PARMS) {
                 Globalreg::globalreg->entrytracker->get_shared_instance_as<bluetooth_tracked_device>(btphy->bluetooth_device_entry_id);
 
             btdev->insert(btdev_bluetooth);
-
-            new_device = true;
         }
 
         if (powerlevel_j.is_number())
@@ -434,19 +462,14 @@ int kis_bluetooth_phy::packet_bluetooth_scan_json_classifier(CHAINCALL_PARMS) {
             }
         }
 
-        if (new_device) {
-            if (in_pack->common_info.source.OUI() == mac_addr::OUI((uint8_t *) "\x80\xe1\x26") ||
-                    in_pack->common_info.source.OUI() == mac_addr::OUI((uint8_t *) "\x80\xe1\x27")) {
-                auto al = fmt::format("A BTLE advertisement packet with a source address "
-                        "matching a Flipper Zero device was seen; The Flipper device is "
-                        "capable of generating BTLE packets which may cause a denial of "
-                        "service or other problems with some BTLE devices.");
-                btphy->alertracker->raise_alert(btphy->alert_flipper_ref, in_pack,
-                        mac_addr{}, btdev->get_macaddr(), mac_addr{}, mac_addr{},
-                        "FHSS", al);
+        // Scan reports carry no address type, and no UUIDs or manufacturer data parsed here
+        const auto named = devname_j.is_string() && !devname_j.get_ref<const std::string&>().empty();
+        if ((new_btdev || named) && !btdev_bluetooth->get_flipper_zero())
+            flipper_zero::flag(*btdev_bluetooth, flipper_zero::match(btaddr_mac, false,
+                        btdev->get_devicename(), std::string{}, std::vector<std::string>{}));
 
-            }
-        }
+        flipper_zero::raise_pending(*btdev_bluetooth, btphy->alertracker,
+                btphy->alert_flipper_ref, in_pack, btdev->get_macaddr());
 
     } catch (const std::exception& e) {
         _MSG_ERROR("Invalid phybluetooth/BT/BTLE scan report: {}", e.what());

@@ -87,6 +87,13 @@ protected:
     std::shared_ptr<tracker_element_byte_array> advertised_data;
 };
 
+// The type of a device's address, in btle.device.address_type
+enum class btle_address_type {
+    unknown = 0,
+    public_address = 1,
+    random_address = 2,
+};
+
 // Future btle attributes
 class btle_tracked_device : public tracker_component {
 public:
@@ -127,6 +134,9 @@ public:
    __Proxy(simultaneous_br_edr_host, uint8_t, bool, bool, simultaneous_br_edr_host);
    __Proxy(pdu_type, uint8_t, uint8_t, uint8_t, pdu_type);
 
+   // A btle_address_type, from the TxAdd bit of the device's latest packet
+   __Proxy(address_type, uint8_t, uint8_t, uint8_t, address_type);
+
    // Advertised 16/32/128-bit service UUIDs, accumulated across every
    // advertisement seen (as hex strings, not this codebase's uuid type).
    __ProxyTrackable(service_uuid_vec, tracker_element_vector_string, service_uuid_vec);
@@ -135,6 +145,13 @@ public:
    // accumulated, unlike service_uuid_vec, since it commonly rotates.
    __Proxy(manuf_company_id, std::string, std::string, std::string, manuf_company_id);
    __Proxy(manuf_data, std::string, std::string, std::string, manuf_data);
+
+   // The Flipper Zero signature the device matched, a flipper_zero::signature; 0 if none
+   __Proxy(flipper_zero, uint8_t, uint8_t, uint8_t, flipper_zero);
+
+   // Matched, and FLIPPERZERO not raised for it yet: a rate limited alert is retried with
+   // the device's next packet.  Not serialized.
+   bool flipper_alert_pending = false;
 
 protected:
     virtual void register_fields() override {
@@ -153,9 +170,14 @@ protected:
                 &simultaneous_br_edr_host);
         register_field("btle.device.pdu_type", "BTLE advertising PDU type",
                 &pdu_type);
+        register_field("btle.device.address_type", "address type: 0 unknown, 1 public, "
+                "2 random", &address_type);
         register_field("btle.device.service_uuid_vec", "advertised service UUIDs", &service_uuid_vec);
         register_field("btle.device.manuf_company_id", "manufacturer company ID", &manuf_company_id);
         register_field("btle.device.manuf_data", "manufacturer data payload", &manuf_data);
+        register_field("btle.device.flipper_zero", "Flipper Zero signature matched: 0 none, "
+                "1 service UUID, 2 STM32 address, 3 Flipper Devices OUI, 4 company ID, 5 name",
+                &flipper_zero);
     }
 
     std::shared_ptr<tracker_element_uint8> le_limited_discoverable;
@@ -164,9 +186,11 @@ protected:
     std::shared_ptr<tracker_element_uint8> simultaneous_br_edr_controller;
     std::shared_ptr<tracker_element_uint8> simultaneous_br_edr_host;
     std::shared_ptr<tracker_element_uint8> pdu_type;
+    std::shared_ptr<tracker_element_uint8> address_type;
     std::shared_ptr<tracker_element_vector_string> service_uuid_vec;
     std::shared_ptr<tracker_element_string> manuf_company_id;
     std::shared_ptr<tracker_element_string> manuf_data;
+    std::shared_ptr<tracker_element_uint8> flipper_zero;
 };
 
 class kis_btle_phy : public kis_phy_handler {

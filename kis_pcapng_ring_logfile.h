@@ -35,6 +35,9 @@
 #include "logtracker.h"
 #include "pcapng_stream_futurebuf.h"
 
+// Default pcapng_ring_buffer_mb
+constexpr unsigned long PCAPNG_RING_DEFAULT_BUFFER_MB = 4;
+
 // Continuous wifi capture written to a multi-slot file ring on tmpfs. Steady
 // state writes zero bytes to permanent storage. On demand (HTTP POST to
 // /logging/pcapng_ring/snapshot/<label>) the current ring is copied to a
@@ -59,13 +62,28 @@ public:
     // then continue capturing for post_seconds into
     //   <persist_dir>/<label>/post.pcapng
     // Returns the final on-disk path of pre.pcapng (post.pcapng is in the
-    // same directory). Throws std::runtime_error on validation or IO error.
-    std::string snapshot(const std::string& label, unsigned int post_seconds);
+    // same directory), and in out_dropped_window, if given, the packets the
+    // ring dropped from the trigger to the end of the post window. Throws
+    // std::runtime_error on validation or IO error.
+    std::string snapshot(const std::string& label, unsigned int post_seconds,
+            uint64_t *out_dropped_window = nullptr);
 
 protected:
-    // Rotate the active ring file: close current, advance index, truncate
-    // and open next. Called from inside the writer thread loop only.
-    void rotate_ring();
+    // Rotate the active ring file: open (truncating) the next slot, swap to a
+    // new buffer, then drain the old buffer into the current slot and close
+    // it. Called from inside the writer thread loop only. Returns false,
+    // changing nothing, if the ring is shutting down or the next slot can't
+    // be opened (the current slot keeps being written); true once the slot
+    // has moved on, including when draining the old one failed, which stops
+    // the ring through writer_failed().
+    bool rotate_ring();
+
+    // Warn about packets dropped because the writer fell behind; rate
+    // limited unless final
+    void report_drops(bool final);
+
+    // Stop the ring after a write error, from the writer thread
+    void writer_failed();
 
     // Absolute path to ring slot `idx`.
     std::string ring_slot_path(unsigned int idx) const;
@@ -126,11 +144,14 @@ protected:
     std::mutex rotation_mutex;
     std::condition_variable rotation_cv;
     uint64_t rotation_count;  // monotonic; protected by rotation_mutex
+    // Forced rotations that failed; protected by rotation_mutex
+    uint64_t failed_rotation_count;
 
     // Block until the writer thread performs at least one rotation cycle
     // (force-triggered or natural). Used by snapshot() to freeze the
     // active slot's bytes into a complete ring file before copying.
-    // Returns true on success, false on timeout / shutdown.
+    // Returns true on success (or on shutdown, as before), false on timeout
+    // or when the forced rotation failed, which returns without waiting.
     bool force_rotate_now(std::chrono::seconds timeout);
 
     // Config (read once in the constructor).
@@ -148,6 +169,19 @@ protected:
     bool log_duplicate_packets;
     bool truncate_duplicate_packets;
     bool log_data_packets;
+
+    // How far, in bytes, the writer may fall behind before packets are dropped from the ring
+    size_t buffer_backlog = 0;
+
+    // Slot size at which the writer rotates; a slot whose successor couldn't be opened keeps
+    // growing and rotation is retried after another slot's worth
+    uint64_t rotate_at_bytes = 0;
+
+    // Packets dropped since the ring was opened, for snapshot responses
+    std::atomic<uint64_t> dropped_packets{0};
+    uint64_t reported_drops = 0;
+    time_t last_drop_report = 0;
+
     int pack_comp_l1data, pack_comp_linkframe;
 
     // Serializes /snapshot calls. Concurrent snapshots are simpler to reason
