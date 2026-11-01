@@ -39,6 +39,7 @@
 #include "alertracker.h"
 
 #include "phy_btle.h"
+#include "flipper_zero.h"
 #include "phy_uav_drone.h"
 
 #include "kaitai/kaitaistream.h"
@@ -378,9 +379,14 @@ int kis_btle_phy::common_classifier(CHAINCALL_PARMS) {
 
     // Store the PDU type from the packet
     btle_dev->set_pdu_type(btle_info->btle_decode->pdu_type());
+    btle_dev->set_address_type(static_cast<uint8_t>(btle_info->btle_decode->is_txaddr_random() ?
+                btle_address_type::random_address : btle_address_type::public_address));
 
     if (btle_info->btle_decode->is_txaddr_random())
         device->set_manuf(Globalreg::globalreg->manufdb->get_random_manuf());
+
+    // Whether this packet could make a device match a Flipper Zero signature it didn't before
+    auto flipper_input = new_dev;
 
     for (auto ad : *btle_info->btle_decode->advertised_data()) {
         if (btle_info->btle_decode->pdu_type() == btle_info->btle_decode->pdu_adv_ind() ||
@@ -406,12 +412,14 @@ int kis_btle_phy::common_classifier(CHAINCALL_PARMS) {
 
         } else if (ad->type() == BTLE_ADVDATA_DEVICE_NAME && ad->length() >= 2) {
             device->set_devicename(munge_to_printable(ad->data()));
+            flipper_input = true;
 
         } else if ((ad->type() == BTLE_ADVDATA_SERVICE_UUID16_INCOMPLETE ||
                     ad->type() == BTLE_ADVDATA_SERVICE_UUID16_COMPLETE) && ad->length() >= 3) {
             // Concatenated 16-bit UUIDs, little-endian.
             const std::string& payload = ad->data();
             auto uuid_vec = btle_dev->get_service_uuid_vec();
+            flipper_input = true;
             for (size_t off = 0; off + 2 <= payload.size(); off += 2) {
                 uint16_t val = (uint8_t) payload[off] | ((uint16_t)(uint8_t) payload[off + 1] << 8);
                 btle_add_unique_uuid(uuid_vec, fmt::format("{:04x}", val));
@@ -440,6 +448,7 @@ int kis_btle_phy::common_classifier(CHAINCALL_PARMS) {
             // First 2 bytes are the company identifier, little-endian.
             const std::string& payload = ad->data();
             uint16_t company_id = (uint8_t) payload[0] | ((uint16_t)(uint8_t) payload[1] << 8);
+            flipper_input = true;
             btle_dev->set_manuf_company_id(fmt::format("{:04x}", company_id));
             btle_dev->set_manuf_data(btle_bytes_to_hex(payload.substr(2)));
         }
@@ -452,19 +461,16 @@ int kis_btle_phy::common_classifier(CHAINCALL_PARMS) {
         else
             _MSG_INFO("Detected new BTLE device {}",
                     in_pack->common_info.source);
-
-        if (in_pack->common_info.source.OUI() == mac_addr::OUI((uint8_t *) "\x80\xe1\x26") ||
-                in_pack->common_info.source.OUI() == mac_addr::OUI((uint8_t *) "\x80\xe1\x27")) {
-            auto al = fmt::format("A BTLE advertisement packet with a source address "
-                    "matching a Flipper Zero device was seen; The Flipper device is "
-                    "capable of generating BTLE packets which may cause a denial of "
-                    "service or other problems with some BTLE devices.");
-            mphy->alertracker->raise_alert(mphy->alert_flipper_ref, in_pack,
-                    mac_addr{}, device->get_macaddr(), mac_addr{}, mac_addr{},
-                    "FHSS", al);
-        }
-
     }
+
+    // The UUIDs or name may come in a later advertisement than the first
+    if (flipper_input && !btle_dev->get_flipper_zero())
+        flipper_zero::flag(*btle_dev, flipper_zero::match(in_pack->common_info.source,
+                    !btle_info->btle_decode->is_txaddr_random(), device->get_devicename(),
+                    btle_dev->get_manuf_company_id(), *btle_dev->get_service_uuid_vec()));
+
+    flipper_zero::raise_pending(*btle_dev, mphy->alertracker, mphy->alert_flipper_ref, in_pack,
+            device->get_macaddr());
 
     return 1;
 }

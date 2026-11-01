@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <ctime>
 #include <future>
 #include <memory>
 #include <set>
@@ -177,7 +178,8 @@ kis_pcapng_ring_logfile::kis_pcapng_ring_logfile(shared_log_builder in_builder) 
     active_slot{0},
     active_slot_bytes{0},
     force_rotate_pending{false},
-    rotation_count{0} {
+    rotation_count{0},
+    failed_rotation_count{0} {
 
     auto cfg = Globalreg::globalreg->kismet_config;
 
@@ -189,6 +191,8 @@ kis_pcapng_ring_logfile::kis_pcapng_ring_logfile(shared_log_builder in_builder) 
     // the ring fits comfortably on small/embedded targets. Bump on larger
     // sensors via the pcapng_ring_file_size_mb / _file_count config keys.
     auto file_size_mb = cfg->fetch_opt_ulong("pcapng_ring_file_size_mb", 8L);
+    if (file_size_mb < 1)
+        file_size_mb = 1; // a 0 MB slot would rotate on every write
     ring_file_size_bytes = static_cast<uint64_t>(file_size_mb) * 1024UL * 1024UL;
 
     ring_file_count = static_cast<unsigned int>(
@@ -227,6 +231,22 @@ kis_pcapng_ring_logfile::kis_pcapng_ring_logfile(shared_log_builder in_builder) 
             "pcapng_ring_log_data_packets",
             cfg->fetch_opt_bool("pcapng_log_data_packets", true));
 
+    // How far the writer may fall behind before packets are dropped from the ring; at least
+    // 1MB, and no more than a slot: a rotation drains the whole backlog into the slot it
+    // closes, so a slot can grow by up to the backlog.  The ring never blocks packet
+    // processing, unlike pcapng_log_blocking: it's for evidence around an event, and stalling
+    // device tracking for it would cost more than it keeps.
+    buffer_backlog =
+        cfg->fetch_opt_ulong("pcapng_ring_buffer_mb", PCAPNG_RING_DEFAULT_BUFFER_MB);
+    buffer_backlog = std::max<size_t>(buffer_backlog, 1) * 1024 * 1024;
+    if (buffer_backlog > ring_file_size_bytes) {
+        // Only worth a word when it was asked for; the default is capped quietly on small slots
+        if (cfg->fetch_opt("pcapng_ring_buffer_mb") != "")
+            _MSG_INFO("pcapng_ring: pcapng_ring_buffer_mb is larger than a ring slot; using {} MB, "
+                    "the pcapng_ring_file_size_mb", ring_file_size_bytes / (1024 * 1024));
+        buffer_backlog = ring_file_size_bytes;
+    }
+
     auto packetchain = Globalreg::fetch_mandatory_global_as<packet_chain>("PACKETCHAIN");
     pack_comp_l1data = packetchain->register_packet_component("L1RAW");
     pack_comp_linkframe = packetchain->register_packet_component("LINKFRAME");
@@ -260,7 +280,8 @@ kis_pcapng_ring_logfile::kis_pcapng_ring_logfile(shared_log_builder in_builder) 
                     }
 
                     try {
-                        auto pre_path = snapshot(label, post_seconds);
+                        uint64_t dropped_window = 0;
+                        auto pre_path = snapshot(label, post_seconds, &dropped_window);
                         // pre.pcapng / post.pcapng share the same directory,
                         // so derive post path by string substitution rather
                         // than recomputing.
@@ -272,6 +293,10 @@ kis_pcapng_ring_logfile::kis_pcapng_ring_logfile(shared_log_builder in_builder) 
                         out["label"] = label;
                         out["pre_path"] = pre_path;
                         out["post_path"] = post_path;
+                        // Since the ring opened, and during this snapshot (from the trigger
+                        // to the end of the post window)
+                        out["dropped_packets"] = dropped_packets.load();
+                        out["dropped_packets_window"] = dropped_window;
                         ostream << out.dump();
                     } catch (const std::runtime_error& e) {
                         std::string what(e.what());
@@ -323,6 +348,7 @@ bool kis_pcapng_ring_logfile::open_log(const std::string& /*in_template*/,
 
     active_slot = 0;
     active_slot_bytes = 0;
+    rotate_at_bytes = ring_file_size_bytes;
 
     auto first_path = ring_slot_path(active_slot);
     set_int_log_path(first_path);
@@ -339,6 +365,11 @@ bool kis_pcapng_ring_logfile::open_log(const std::string& /*in_template*/,
         std::lock_guard<std::mutex> lk(buffer_mutex);
         buffer = std::make_shared<future_chainbuf>(4096, 1024);
     }
+    // A new stream counts drops from 0
+    dropped_packets = 0;
+    reported_drops = 0;
+    last_drop_report = 0;
+
     // pcapng_stream_packetchain stores a raw pointer to the buffer but does
     // not own it (no delete in its dtor — only `chainbuf->cancel()`). Our
     // shared_ptr keeps the buffer alive across the whole logfile lifetime.
@@ -347,7 +378,7 @@ bool kis_pcapng_ring_logfile::open_log(const std::string& /*in_template*/,
             buffer.get(),
             pcapng_logfile_accept_ftor(log_duplicate_packets, log_data_packets),
             pcapng_logfile_select_ftor(truncate_duplicate_packets),
-            static_cast<size_t>(16384));
+            buffer_backlog);
 
     _MSG_INFO("Opened pcapng_ring on '{}' ({} slots * {} MB = {} MB total)",
             ring_dir, ring_file_count, ring_file_size_bytes / (1024 * 1024),
@@ -388,11 +419,10 @@ bool kis_pcapng_ring_logfile::open_log(const std::string& /*in_template*/,
                             ring_slot_path(active_slot),
                             ferr ? kis_strerror_r(e) : "short write");
                     // Don't call close_log() from inside the writer thread —
-                    // it joins this thread (UB / abort). Flag shutdown and
+                    // it joins this thread (UB / abort). Stop the ring and
                     // exit the loop; the destructor or log_tracker will run
                     // close_log() from a safe thread.
-                    shutting_down = true;
-                    rotation_cv.notify_all();
+                    writer_failed();
                     return;
                 }
             }
@@ -400,20 +430,30 @@ bool kis_pcapng_ring_logfile::open_log(const std::string& /*in_template*/,
             buf->consume(sz);
             active_slot_bytes += sz;
 
+            report_drops(false);
+
             bool force = force_rotate_pending.exchange(false);
-            bool natural = active_slot_bytes >= ring_file_size_bytes;
+            bool natural = active_slot_bytes >= rotate_at_bytes;
 
             if (force || natural) {
-                rotate_ring();
-                // Signal any snapshot thread blocked in force_rotate_now()
-                // that a rotation completed. We count both forced and
-                // natural rotations — a natural one in the middle of a
-                // snapshot wait is just as good for freezing the boundary.
+                bool rotated = rotate_ring();
                 {
+                    // Signal any snapshot thread blocked in force_rotate_now():
+                    // a rotation completed (forced or natural; a natural one in
+                    // the middle of a snapshot wait freezes the boundary just as
+                    // well), or a forced one failed and it needn't wait it out
                     std::lock_guard<std::mutex> lk(rotation_mutex);
-                    rotation_count++;
+                    if (rotated)
+                        rotation_count++;
+                    else if (force)
+                        failed_rotation_count++;
                 }
-                rotation_cv.notify_all();
+                if (rotated || force)
+                    rotation_cv.notify_all();
+                if (!rotated && natural) {
+                    // The next slot couldn't be opened; keep writing this one and retry later
+                    rotate_at_bytes = active_slot_bytes + ring_file_size_bytes;
+                }
             }
         }
     });
@@ -435,7 +475,56 @@ bool kis_pcapng_ring_logfile::open_log(const std::string& /*in_template*/,
     return true;
 }
 
-void kis_pcapng_ring_logfile::rotate_ring() {
+void kis_pcapng_ring_logfile::report_drops(bool final) {
+    if (pcapng == nullptr)
+        return;
+
+    const auto dropped = pcapng->get_dropped_packets();
+    dropped_packets = dropped;
+
+    if (dropped == reported_drops)
+        return;
+
+    const auto now = time(nullptr);
+
+    if (!final && now - last_drop_report < 10)
+        return;
+
+    const auto msg = fmt::format("pcapng_ring: dropped {} packets ({} total) because writing "
+            "the ring could not keep up; snapshots may be missing packets.  Increase "
+            "pcapng_ring_buffer_mb (at most pcapng_ring_file_size_mb)",
+            dropped - reported_drops, dropped);
+
+    // Logs are closed after the message bus stops printing during shutdown
+    if (Globalreg::globalreg->spindown)
+        fmt::print(stderr, "ERROR: {}\n", msg);
+    else
+        _MSG_ERROR("{}", msg);
+
+    reported_drops = dropped;
+    last_drop_report = now;
+}
+
+void kis_pcapng_ring_logfile::writer_failed() {
+    // Shown as closed now; close_log() still joins the threads and frees the stream
+    set_int_log_open(false);
+    shutting_down = true;
+    rotation_cv.notify_all();
+
+    // Skip the per-packet work until close_log() removes the stream
+    if (pcapng != nullptr)
+        pcapng->pause_stream();
+
+    std::shared_ptr<future_chainbuf> buf;
+    {
+        std::lock_guard<std::mutex> lk(buffer_mutex);
+        buf = buffer;
+    }
+    if (buf)
+        buf->cancel();
+}
+
+bool kis_pcapng_ring_logfile::rotate_ring() {
     // Called from inside the writer thread, so the writer can't be touching
     // the old slot file while we're mid-rotate. Snapshot thread reads
     // `buffer` member via buffer_mutex; we hold buffer_mutex briefly during
@@ -443,7 +532,20 @@ void kis_pcapng_ring_logfile::rotate_ring() {
     // shared_ptr value.
 
     if (shutting_down)
-        return;
+        return false;
+
+    auto next_slot = (active_slot + 1) % ring_file_count;
+    auto new_path = ring_slot_path(next_slot);
+
+    // Open (truncating) the next slot before swapping anything, so a failure leaves the
+    // current slot running instead of losing packets; the caller retries later.  Once the
+    // ring has cycled this discards the oldest data.
+    FILE *new_file = fopen(new_path.c_str(), "w");
+    if (new_file == nullptr) {
+        _MSG_ERROR("pcapng_ring: failed to open next ring slot '{}' - {}; continuing to write "
+                "'{}'", new_path, kis_strerror_r(errno), ring_slot_path(active_slot));
+        return false;
+    }
 
     std::shared_ptr<future_chainbuf> old_buffer;
     {
@@ -463,31 +565,18 @@ void kis_pcapng_ring_logfile::rotate_ring() {
     {
         std::lock_guard<std::mutex> lk(buffer_mutex);
         buffer = new_buffer;
+        // close_log() sets shutting_down before it takes buffer_mutex to cancel the buffer
+        // it sees; if that was the old one, cancel this one so the writer loop still ends
+        // and close_log()'s join returns
+        if (shutting_down)
+            new_buffer->cancel();
     }
 
-    active_slot = (active_slot + 1) % ring_file_count;
+    active_slot = next_slot;
     active_slot_bytes = 0;
+    rotate_at_bytes = ring_file_size_bytes;
 
-    auto new_path = ring_slot_path(active_slot);
     set_int_log_path(new_path);
-
-    // Truncate the slot we're about to overwrite. On a fresh start this is
-    // a no-op; once the ring has cycled it discards the oldest data.
-    FILE *new_file = fopen(new_path.c_str(), "w");
-    if (new_file == nullptr) {
-        _MSG_ERROR("pcapng_ring: failed to open next ring slot '{}' - {}; "
-                "stopping ring", new_path, kis_strerror_r(errno));
-        if (old_file != nullptr)
-            fclose(old_file);
-        // Flag shutdown; the writer loop's next iteration sees ring_file
-        // is still the old (now closed) handle but will also see
-        // shutting_down and return. We don't call close_log() here —
-        // that would join this very thread (UB).
-        ring_file = nullptr;
-        shutting_down = true;
-        rotation_cv.notify_all();
-        return;
-    }
     ring_file = new_file;
 
     // Drain the tail of the old buffer (anything still in flight before the
@@ -502,7 +591,10 @@ void kis_pcapng_ring_logfile::rotate_ring() {
                 _MSG_ERROR("pcapng_ring: error draining ring slot '{}' - {}",
                         old_path,
                         ferror(old_file) ? kis_strerror_r(e) : "short write");
-                break;
+                // Don't call close_log() from the writer thread; it joins it
+                fclose(old_file);
+                writer_failed();
+                return true;
             }
         }
         old_buffer->consume(sz);
@@ -511,12 +603,15 @@ void kis_pcapng_ring_logfile::rotate_ring() {
     fclose(old_file);
     // old_buffer's shared_ptr drops here; the buffer object lives until any
     // outstanding snapshot-thread copy (via force_rotate_now) also drops.
+    return true;
 }
 
 void kis_pcapng_ring_logfile::close_log() {
     kis_lock_guard<kis_mutex> lk(log_mutex, "pcapng_ring close_log");
 
-    if (!get_log_open())
+    // writer_failed() already marks the log closed, so check what's left to clean up
+    if (!stream_t.joinable() && !prune_t.joinable() && ring_file == nullptr &&
+            pcapng == nullptr)
         return;
 
     set_int_log_open(false);
@@ -545,6 +640,7 @@ void kis_pcapng_ring_logfile::close_log() {
     }
 
     if (pcapng != nullptr) {
+        report_drops(true);
         delete pcapng;
         pcapng = nullptr;
     }
@@ -648,10 +744,11 @@ bool kis_pcapng_ring_logfile::force_rotate_now(std::chrono::seconds timeout) {
     if (shutting_down)
         return false;
 
-    uint64_t before;
+    uint64_t before, failed_before;
     {
         std::lock_guard<std::mutex> lk(rotation_mutex);
         before = rotation_count;
+        failed_before = failed_rotation_count;
     }
 
     force_rotate_pending = true;
@@ -670,10 +767,14 @@ bool kis_pcapng_ring_logfile::force_rotate_now(std::chrono::seconds timeout) {
     if (buf)
         buf->sync();
 
+    // A failed forced rotation (the next slot couldn't be opened) returns at once rather
+    // than holding the HTTP worker for the whole timeout
     std::unique_lock<std::mutex> lk(rotation_mutex);
-    return rotation_cv.wait_for(lk, timeout, [this, before]() {
-        return rotation_count > before || shutting_down.load();
+    rotation_cv.wait_for(lk, timeout, [this, before, failed_before]() {
+        return rotation_count > before || failed_rotation_count > failed_before ||
+            shutting_down.load();
     });
+    return rotation_count > before || shutting_down.load();
 }
 
 uint64_t kis_pcapng_ring_logfile::persist_dir_free_bytes() const {
@@ -688,7 +789,7 @@ uint64_t kis_pcapng_ring_logfile::persist_dir_free_bytes() const {
 }
 
 std::string kis_pcapng_ring_logfile::snapshot(const std::string& label,
-        unsigned int post_seconds) {
+        unsigned int post_seconds, uint64_t *out_dropped_window) {
     if (!validate_snapshot_label(label))
         throw std::runtime_error("invalid snapshot label");
 
@@ -734,8 +835,12 @@ std::string kis_pcapng_ring_logfile::snapshot(const std::string& label,
     // "complete" slot eligible for copy. Without this, low-traffic
     // captures produce 0-byte pre.pcapng because list_complete_ring_slots
     // excludes the active slot to avoid racing the writer's fwrite.
+    // Drops from here to the end of the post window are the ones that can leave gaps in
+    // what this snapshot captured around its trigger
+    const uint64_t dropped_before = dropped_packets.load();
+
     if (!force_rotate_now(std::chrono::seconds(5))) {
-        _MSG_ERROR("pcapng_ring: snapshot '{}' pre-rotate did not complete "
+        _MSG_ERROR("pcapng_ring: snapshot '{}' pre-rotate failed or did not complete "
                 "within 5s — forensic evidence may be incomplete", label);
     }
 
@@ -760,9 +865,13 @@ std::string kis_pcapng_ring_logfile::snapshot(const std::string& label,
     // the active one and thus excluded from list_complete_ring_slots; rotate
     // it out so it becomes selectable as a post source.
     if (!force_rotate_now(std::chrono::seconds(5))) {
-        _MSG_ERROR("pcapng_ring: snapshot '{}' post-rotate did not complete "
+        _MSG_ERROR("pcapng_ring: snapshot '{}' post-rotate failed or did not complete "
                 "within 5s — forensic evidence may be incomplete", label);
     }
+
+    // The writer updates dropped_packets after each drain, and each rotation above follows one
+    if (out_dropped_window != nullptr)
+        *out_dropped_window = dropped_packets.load() - dropped_before;
 
     // Post sources = all complete slots NOT already in pre. After the
     // second force rotate, the slot that was active during the post window

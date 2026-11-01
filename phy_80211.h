@@ -172,6 +172,7 @@ class dot11_packinfo : public packet_component {
             ibss = 0;
             channel = "0";
             encrypted = 0;
+            mgmt_protected = false;
             qos = 0;
             timestamp = 0;
             sequence_number = 0;
@@ -298,6 +299,12 @@ class dot11_packinfo : public packet_component {
 
         // Is this encrypted?
         int encrypted;
+
+        // The Protected Frame bit on a management frame (802.11w, or WEP shared key
+        // authentication); the body after the header is encrypted, so fixed fields like the
+        // reason code can't be read
+        bool mgmt_protected;
+
         int beacon_interval;
 
         uint16_t qos;

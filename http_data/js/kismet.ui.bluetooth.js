@@ -25,6 +25,22 @@ kismet_ui.AddDeviceRowHighlight({
 });
 
 kismet_ui.AddDeviceRowHighlight({
+    name: "Flipper Zero",
+    description: "Highlight Bluetooth devices matching a Flipper Zero signature",
+    priority: 50,
+    defaultcolor: "#ffb3b3",
+    defaultenable: true,
+    fields: [
+        'btle.device/btle.device.flipper_zero',
+        'bluetooth.device/bluetooth.device.flipper_zero'
+    ],
+    selector: function(data) {
+        return (data['btle.device.flipper_zero'] || 0) != 0 ||
+            (data['bluetooth.device.flipper_zero'] || 0) != 0;
+    }
+});
+
+kismet_ui.AddDeviceRowHighlight({
     name: "Bluetooth BR/EDR Device",
     description: "Highlight classic BR/EDR Bluetooth devices",
     priority: 101,

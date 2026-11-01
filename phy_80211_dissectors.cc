@@ -1003,6 +1003,8 @@ int kis_80211_phy::packet_dot11_dissector(kis_packet* in_pack) {
 
     // Rip apart management frames
     if (fc->type == packet_management) {
+        packinfo->mgmt_protected = fc->wep;
+
         packinfo->type = packet_management;
         in_pack->common_info.type = packet_basic_mgmt;
 
@@ -1255,6 +1257,11 @@ int kis_80211_phy::packet_dot11_dissector(kis_packet* in_pack) {
                 packinfo->source_mac = mac_addr(addr1, PHY80211_MAC_LEN);
                 packinfo->bssid_mac = mac_addr(addr2, PHY80211_MAC_LEN);
 
+                // A protected frame's reason code is encrypted; reading it would make most
+                // disconnects on a network with management frame protection look invalid
+                if (packinfo->mgmt_protected)
+                    break;
+
                 packinfo->mgt_reason_code = (uint16_t) *((uint16_t *) &(chunk->data()[24]));
 
                 if ((packinfo->mgt_reason_code >= 25 && packinfo->mgt_reason_code <= 31) ||
@@ -1302,6 +1309,11 @@ int kis_80211_phy::packet_dot11_dissector(kis_packet* in_pack) {
                 packinfo->dest_mac = mac_addr(addr0, PHY80211_MAC_LEN);
                 packinfo->source_mac = mac_addr(addr1, PHY80211_MAC_LEN);
                 packinfo->bssid_mac = mac_addr(addr2, PHY80211_MAC_LEN);
+
+                // A protected frame's reason code is encrypted; reading it would make most
+                // disconnects on a network with management frame protection look invalid
+                if (packinfo->mgmt_protected)
+                    break;
 
                 packinfo->mgt_reason_code = (uint16_t) *((uint16_t *) &(chunk->data()[24]));
 

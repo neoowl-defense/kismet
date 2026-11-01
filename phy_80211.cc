@@ -1089,7 +1089,7 @@ kis_80211_phy::kis_80211_phy(int in_phyid) :
                     return generate_handshake_pcap(con, dev, dot11, mac_addr(), "pmkid");
                 }));
 
-    httpd->register_route("/phy/phy80211/pcap/by-bssid/:mac/packets.pcapng", {"GET"}, httpd->RO_ROLE, {"pcapng"},
+    httpd->register_route("/phy/phy80211/pcap/by-bssid/:mac/packets", {"GET"}, httpd->RO_ROLE, {"pcapng"},
             std::make_shared<kis_net_web_function_endpoint>(
                 [this](std::shared_ptr<kis_net_beast_httpd_connection> con) {
                     auto mac = string_to_n<mac_addr>(con->uri_params()[":mac"]);
@@ -3726,8 +3726,10 @@ void kis_80211_phy::handle_wsc_fragments(kis_packet *in_pack, dot11_packinfo *do
 }
 
 void kis_80211_phy::handle_wsc_deauth(kis_packet *in_pack, dot11_packinfo *dot11info) {
-    // wps_monitor may also reject the zero length fragment with reason 0 (reserved)
-    if (dot11info->mgt_reason_code != 0 || dot11info->source_mac != dot11info->bssid_mac)
+    // wps_monitor may also reject the zero length fragment with reason 0 (reserved); a
+    // protected frame's reason code is encrypted, so it isn't read and stays 0
+    if (dot11info->mgmt_protected || dot11info->mgt_reason_code != 0 ||
+            dot11info->source_mac != dot11info->bssid_mac)
         return;
 
     {
@@ -4926,6 +4928,8 @@ void kis_80211_phy::process_client(const std::shared_ptr<kis_tracked_device_base
 
     } else if (dot11info->type == packet_data) {
         // Handle the data records for this client association, we're not just a management link
+
+        client_record->inc_datasize(dot11info->datasize);
 
         if (dot11info->fragmented)
             client_record->inc_num_fragments(1);

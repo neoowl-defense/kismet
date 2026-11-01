@@ -73,6 +73,14 @@ enum class bt_device_type {
     bt,
 };
 
+// The type of a device's address, in bluetooth.device.address_type; a BR/EDR address is
+// public
+enum class bt_address_type {
+    unknown = 0,
+    public_address = 1,
+    random_address = 2,
+};
+
 class bluetooth_tracked_device : public tracker_component {
 public:
     bluetooth_tracked_device() :
@@ -121,6 +129,9 @@ public:
 
     __Proxy(connectable, uint8_t, uint8_t, uint8_t, connectable);
 
+    // A bt_address_type; unknown when the capture source doesn't say
+    __Proxy(address_type, uint8_t, uint8_t, uint8_t, address_type);
+
     // Advertised service UUIDs as hex strings; separate from
     // service_uuid_vec above, which holds real uuid objects and isn't
     // populated by the linuxbthci JSON path this one feeds.
@@ -129,6 +140,13 @@ public:
     __ProxyTrackable(service_uuid_strs, tracker_element_vector_string, service_uuid_strs);
     __Proxy(manuf_company_id, std::string, std::string, std::string, manuf_company_id);
     __Proxy(manuf_data, std::string, std::string, std::string, manuf_data);
+
+    // The Flipper Zero signature the device matched, a flipper_zero::signature; 0 if none
+    __Proxy(flipper_zero, uint8_t, uint8_t, uint8_t, flipper_zero);
+
+    // Matched, and FLIPPERZERO not raised for it yet: a rate limited alert is retried with
+    // the device's next packet.  Not serialized.
+    bool flipper_alert_pending = false;
 
 protected:
     virtual void register_fields() override {
@@ -146,11 +164,16 @@ protected:
         register_field("bluetooth.device.txpower", "advertised transmit power", &txpower);
         register_field("bluetooth.device.pathloss", "signal pathloss", &pathloss);
         register_field("bluetooth.device.connectable", "device is connectable", &connectable);
+        register_field("bluetooth.device.address_type", "address type: 0 unknown, 1 public, "
+                "2 random", &address_type);
 
         register_field("bluetooth.device.service_uuid_strs", "advertised service UUIDs, as hex strings",
                 &service_uuid_strs);
         register_field("bluetooth.device.manuf_company_id", "manufacturer company ID", &manuf_company_id);
         register_field("bluetooth.device.manuf_data", "manufacturer data payload", &manuf_data);
+        register_field("bluetooth.device.flipper_zero", "Flipper Zero signature matched: 0 none, "
+                "1 service UUID, 2 STM32 address, 3 Flipper Devices OUI, 4 company ID, 5 name",
+                &flipper_zero);
     }
 
     virtual void reserve_fields(std::shared_ptr<tracker_element_map> e) override {
@@ -173,10 +196,12 @@ protected:
 	std::shared_ptr<tracker_element_int16> pathloss;
 
     std::shared_ptr<tracker_element_uint8> connectable;
+    std::shared_ptr<tracker_element_uint8> address_type;
 
     std::shared_ptr<tracker_element_vector_string> service_uuid_strs;
     std::shared_ptr<tracker_element_string> manuf_company_id;
     std::shared_ptr<tracker_element_string> manuf_data;
+    std::shared_ptr<tracker_element_uint8> flipper_zero;
 };
 
 class kis_bluetooth_phy : public kis_phy_handler {

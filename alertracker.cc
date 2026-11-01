@@ -733,11 +733,17 @@ alert_tracker::last_alerts_endpoint(std::shared_ptr<kis_net_beast_httpd_connecti
         return transmit;
     }
 
+    const double now = ts_now_to_double();
+
+    // Negative timestamps are relative to now, as in /devices/last-time
+    if (since_time < 0)
+        since_time = now + since_time;
+
     if (wrap) {
         wrapper = std::make_shared<tracker_element_map>();
         wrapper->insert(msgvec);
 
-        auto ts = std::make_shared<tracker_element_double>(alert_timestamp_id, ts_now_to_double());
+        auto ts = std::make_shared<tracker_element_double>(alert_timestamp_id, now);
         wrapper->insert(ts);
 
         transmit = wrapper;

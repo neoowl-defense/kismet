@@ -62,6 +62,12 @@ rest_message_client::rest_message_client() :
                 [this](std::shared_ptr<kis_net_beast_httpd_connection> con) {
                     auto ts_k = con->uri_params().find(":timestamp");
                     auto ts = string_to_n<long>(ts_k->second);
+                    // Messages are stamped with last_tv_sec (messagebus.h), as devices are
+                    const auto now = (long) Globalreg::globalreg->last_tv_sec;
+
+                    // Negative timestamps are relative to now, as in /devices/last-time
+                    if (ts < 0)
+                        ts = now + ts;
 
                     kis_lock_guard<kis_mutex> lk(msg_mutex, "/messagebus/last-time/messages");
                     auto wrapper = std::make_shared<tracker_element_map>();
